@@ -58,7 +58,7 @@ python -m black --check src tests
 
 - テストカバレッジ 100% を維持する
 - `flake8`、`mypy`、`black --check` を警告なしで通過する
-- CI での品質ゲートを維持し、テスト失敗や静的解析エラーが発生しないことを確認する
+- コミット・PR 提出前にローカル環境で `pytest`、`flake8`、`mypy`、`black --check` を実行し、エラーおよび警告がゼロであることを確認する
 - 重大なセキュリティ要件（Zero Leakage Rule、AES-256-GCM、Windows パス安全性）に違反しないことを確認する
 
 ## 参考リンク

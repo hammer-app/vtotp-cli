@@ -24,15 +24,29 @@ pip install -e ".[build]"
 ### 1. Standalone 版（ZIP 配布）
 
 ```bash
-python -m nuitka --standalone --assume-yes-for-downloads --output-dir=dist/standalone --output-filename=vtotp --include-package=vtotp --include-package=cryptography src/vtotp/__main__.py
+python -m nuitka --standalone --assume-yes-for-downloads \
+  --output-dir=dist/standalone --output-filename=vtotp \
+  --include-package=vtotp --include-package=cryptography \
+  --company-name="vtotp Project" --product-name="vtotp CLI" \
+  --file-version=<VERSION> --product-version=<VERSION> \
+  --file-description="Custom CLI TOTP Authenticator" \
+  --copyright="Copyright (c) vtotp Project" \
+  src/vtotp/__main__.py
 ```
 
-この形式は、依存 DLL と Python ランタイムを含むフォルダ一式を ZIP で配布するため、起動が速く、実行時の一時展開が不要です。
+この形式は、依存 DLL と Python ランタイムを含むフォルダ一式を ZIP で配布するため、起動が速く、実行時の一時展開が不要です。（※ ローカルでの動作検証時は PE メタデータ引数を省略可能です）
 
 ### 2. Onefile 版（単一 EXE）
 
 ```bash
-python -m nuitka --standalone --onefile --assume-yes-for-downloads --output-dir=dist/onefile --output-filename=vtotp --include-package=vtotp --include-package=cryptography src/vtotp/__main__.py
+python -m nuitka --standalone --onefile --assume-yes-for-downloads \
+  --output-dir=dist/onefile --output-filename=vtotp \
+  --include-package=vtotp --include-package=cryptography \
+  --company-name="vtotp Project" --product-name="vtotp CLI" \
+  --file-version=<VERSION> --product-version=<VERSION> \
+  --file-description="Custom CLI TOTP Authenticator" \
+  --copyright="Copyright (c) vtotp Project" \
+  src/vtotp/__main__.py
 ```
 
 Onefile 版は単一ファイルで持ち運びやすく、USB メモリや特定の作業フォルダへの配置に向いています。ただし、実行時に一時フォルダへ展開が発生するため、Standalone 版より待機時間が増える可能性があります。
@@ -48,7 +62,7 @@ GitHub Actions の [../.github/workflows/release.yml](../.github/workflows/relea
 3. Standalone 版に対して `--version` / `--help` / `init` のスモークテストを実行
 4. PE メタデータ（CompanyName / ProductName / FileDescription / ProductVersion）を検証
 5. ZIP 圧縮と展開後の smoke test を実行
-6. Onefile EXE 版をビルド
+6. Onefile EXE 版をビルド後、`dist/onefile/vtotp.exe` を配布ルート `dist/vtotp.exe` へ配置
 7. Onefile 版にも同じ smoke test を実行
 8. SHA-256 sidecar の生成・検証
 9. GitHub Release へ成果物をアップロード
@@ -99,5 +113,5 @@ gh release edit <tag> --latest --prerelease=false
 ## 参考リンク
 
 - [../README.md](../README.md)
-- [../docs/REQUIREMENTS.md](../docs/REQUIREMENTS.md)
+- [REQUIREMENTS.md](REQUIREMENTS.md)
 - [DESIGN.md](DESIGN.md)
