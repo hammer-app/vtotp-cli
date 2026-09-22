@@ -21,6 +21,8 @@ pip install -e ".[build]"
 
 ## ビルド手順
 
+> **Note**: 以下の複数行コマンド例は Bash/POSIX 形式（`\`）で記載しています。Windows の PowerShell から直接実行する場合は、改行を削除して 1 行にまとめるか、行継続文字をバッククォート（`` ` ``）に置き換えて実行してください。
+
 ### 1. Standalone 版（ZIP 配布）
 
 ```bash

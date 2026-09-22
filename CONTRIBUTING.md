@@ -56,9 +56,7 @@ python -m black --check src tests
 
 ## 検証基準
 
-- テストカバレッジ 100% を維持する
-- `flake8`、`mypy`、`black --check` を警告なしで通過する
-- コミット・PR 提出前にローカル環境で `pytest`、`flake8`、`mypy`、`black --check` を実行し、エラーおよび警告がゼロであることを確認する
+- コミット・PR 提出前にローカル環境で `pytest`、`flake8`、`mypy`、`black --check` を実行し、全テスト通過（カバレッジ 100% 維持）および警告ゼロであることを確認する
 - 重大なセキュリティ要件（Zero Leakage Rule、AES-256-GCM、Windows パス安全性）に違反しないことを確認する
 
 ## 参考リンク
