@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import locale
 import string
+import sys
 
 import pytest
 
@@ -15,6 +17,10 @@ from vtotp.i18n.catalog import (
     get_catalog,
 )
 from vtotp.i18n.resolver import ENV_LANG_VARIABLE, LanguageResolver, detect_os_locale
+
+#: conftest.pyのautouse fixtureがモックする前の、実際のlocale関数への参照。
+_REAL_SETLOCALE = locale.setlocale
+_REAL_GETLOCALE = locale.getlocale
 
 
 def _placeholders(template: str) -> set[str]:
@@ -234,3 +240,56 @@ class TestDetectOsLocale:
 
         monkeypatch.setattr(locale_module, "setlocale", _raise)
         assert detect_os_locale() is None
+
+    def test_queries_lc_ctype_instead_of_lc_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """複合ロケール文字列を避けるため、LC_ALLではなくLC_CTYPEで問い合わせることを確認する。"""
+        import locale as locale_module
+
+        categories: list[int] = []
+
+        def _record_setlocale(category: int, *_args: object) -> str:
+            categories.append(category)
+            return "C"
+
+        def _record_getlocale(category: int) -> tuple[str, str]:
+            categories.append(category)
+            return ("ja_JP", "UTF-8")
+
+        monkeypatch.setattr(locale_module, "setlocale", _record_setlocale)
+        monkeypatch.setattr(locale_module, "getlocale", _record_getlocale)
+
+        assert detect_os_locale() == "ja_JP"
+        assert categories
+        assert all(category == locale_module.LC_CTYPE for category in categories)
+
+    def test_returns_none_when_getlocale_cannot_parse_locale_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """getlocaleが未知のロケール名でValueErrorを送出した場合、Noneを返すことを確認する。"""
+        import locale as locale_module
+
+        def _raise(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("unknown locale")
+
+        monkeypatch.setattr(locale_module, "getlocale", _raise)
+        assert detect_os_locale() is None
+
+    def test_does_not_raise_with_real_locale_module_and_mixed_categories(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """実際のlocaleモジュールで、カテゴリ混在時にも例外を送出しないことを確認する。
+
+        POSIX環境では ``LC_CTYPE`` のみを設定すると ``setlocale(LC_ALL)`` が複合文字列を
+        返す状態になり、以前の実装では ``getlocale(LC_ALL)`` が ``TypeError`` を送出していた。
+        """
+        import locale as locale_module
+
+        monkeypatch.setattr(locale_module, "setlocale", _REAL_SETLOCALE)
+        monkeypatch.setattr(locale_module, "getlocale", _REAL_GETLOCALE)
+        if not sys.platform.startswith("win"):
+            monkeypatch.setenv("LC_CTYPE", "C.UTF-8")
+
+        result = detect_os_locale()
+        assert result is None or isinstance(result, str)
