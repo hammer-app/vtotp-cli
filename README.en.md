@@ -83,7 +83,7 @@ cd vtotp-cli
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# Install (add ".[dev]" to include development dependencies)
+# Install
 pip install -e .
 ```
 
@@ -279,45 +279,12 @@ When calling vtotp from a script, use these exit codes to determine the result:
 
 ---
 
-## Development and Testing
+## Development and Build
 
-This project follows test-driven development (TDD) and maintains a fully passing test suite, 100% coverage, and strict static analysis at all times.
+- Development environment setup and testing instructions: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Binary build and CI specifications: [docs/BUILD.md](docs/BUILD.md)
 
-```powershell
-# Install with test dependencies, in editable mode
-pip install -e ".[dev]"
-
-# Run the full unit and integration test suite with coverage
-python -m pytest --cov=src/vtotp --cov-report=term-missing
-
-# Static analysis (flake8 picks up its config from the repo root's .flake8 automatically)
-python -m flake8 src tests
-python -m mypy src
-python -m black --check src tests
-
-```
-
-`flake8` runs against the repo root's [`.flake8`](.flake8) config (`max-line-length = 88` / `extend-ignore = E203, W503`), which is chosen to not conflict with Black's formatting.
-
-Current verified status: **655 passed, 1 skipped** (the one skip is a Windows-only exemption for a test that verifies permission revocation via `os.chmod`, which isn't reliable on Windows), at **100%** coverage. `flake8` / `mypy` / `black --check` all report zero warnings. The test suite is isolated from the host's OS locale and `VTOTP_LANG`/`LANG`/`LC_ALL` environment variables, so results are stable regardless of the machine it runs on.
-
-### Building the binaries (hybrid distribution)
-
-Both distributed binary formats (Standalone ZIP and Onefile EXE) are built with **Nuitka**.
-
-```powershell
-# Install with build dependencies (nuitka, zstandard), in editable mode
-pip install -e ".[build]"
-
-# ① Build the standalone (folder) variant
-python -m nuitka --standalone --assume-yes-for-downloads --output-dir=dist/standalone --output-filename=vtotp --include-package=vtotp --include-package=cryptography src/vtotp/__main__.py
-
-# ② Build the onefile (single-executable) variant
-python -m nuitka --standalone --onefile --assume-yes-for-downloads --output-dir=dist/onefile --output-filename=vtotp --include-package=vtotp --include-package=cryptography src/vtotp/__main__.py
-
-```
-
-CI ([`.github/workflows/release.yml`](.github/workflows/release.yml)) builds both variants on every `v*` tag push, embeds Windows PE metadata (company name, product name, version, description, copyright), runs `--version` / `--help` / `init` smoke tests, generates and verifies SHA-256 checksums, and publishes the release to GitHub as a **pre-release**. Once the binaries have cleared antivirus false-positive review and real-machine verification, the release is promoted to the "Latest" release by hand, without rebuilding. See Sections 18 and 22 of [`docs/DESIGN.md`](docs/DESIGN.md) for the full design rationale behind the build parameters.
+This project continuously maintains testing, static analysis, and build verification, with a policy of keeping 100% coverage and zero warnings.
 
 ---
 

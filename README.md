@@ -4,7 +4,7 @@
 
 Windows 環境での実用性と堅牢性を重視して設計された、高セキュリティな CLI TOTP（時間基準ワンタイムパスワード）認証ツールです。
 
-マスターキーと暗号化データの物理的分離、メモリ・ログへのシークレット完全非露出（Zero Leakage Rule）、そして Windows 特有のパス入力挙動に完全対応しています。
+マスターキーと暗号化データの物理的分離、メモリ・ログへのシークレット完全非露出（Zero Leakage Rule）、そして Windows 特有のパス入力挙動に完全対応した設計で、端末固定かつポータブルな運用を重視しています。
 
 ---
 
@@ -15,7 +15,7 @@ Windows 環境での実用性と堅牢性を重視して設計された、高セ
   - 生成された 6 桁コードのみを `stdout`（標準出力）へ出力します。クリップボード連携や他コマンドへのパイプ渡し（`vtotp github | clip`）でも安全です。
   - 残り有効時間バーや進捗表示、案内・警告・エラーメッセージはすべて `stderr`（標準エラー出力）へ分離されます。
   - エラー発生時や通常出力時に、マスターキーや平文シークレットが画面・ログへ漏洩することは一切ありません。
-- **日本語・英語の完全な多言語対応**: ヘルプ・プロンプト・エラーメッセージ等の全表示文言が日英で切り替え可能です（`-l` / `--lang`、環境変数、`config.json`、OS ロケールの優先順位で自動解決）。
+- **日本語・英語の完全な多言語対応**: ヘルプ・プロンプト・エラーメッセージ等の全表示文言が日英で切り替え可能です（`-l` / `--lang`、環境変数、設定ファイルで解決）。
 - **Windows フレンドリー**:
   - エクスプローラーの「パスのコピー」等で混入する引用符（`"` や `'`）や全角空白混じりのパスを自動正規化。
   - Windows 特有の不正文字による `[WinError 123]` や未処理例外（Traceback）の露出を完全に防ぎます。
@@ -66,7 +66,7 @@ C:\Tools\vtotp\vtotp.exe --version
 C:\Tools\vtotp\vtotp.exe --version
 ```
 
-実行時の一時解凍やセキュリティ製品のスキャン状況によっては自己展開による待機が発生する場合がありますが、フォルダ管理やインストール作業が一切不要で、単一ファイルとして手軽に持ち運べます。
+実行時の一時解凍やセキュリティ製品のスキャン状況によっては自己展開による待機が発生する場合がありますが、フォルダ管理やインストールが簡単です。
 
 いずれの形態も pip や仮想環境のセットアップは不要です。以降のクイックスタートの `vtotp` コマンドは、そのまま `vtotp.exe` に読み替えて実行できます。
 
@@ -83,7 +83,7 @@ cd vtotp-cli
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# インストール（開発依存パッケージを含む場合: ".[dev]"）
+# インストール
 pip install -e .
 ```
 
@@ -100,7 +100,6 @@ pip install -e .
 ```powershell
 # 対話プロンプトで保存先パス・表示言語を入力する場合
 vtotp init
-
 ```
 
 対話プロンプトが表示されたら、鍵の保存先パス（例: `"C:\Users\<user>\OneDrive\個人用 Vault\master.key"`）を指定します。引用符で囲んだまま貼り付けても自動的に除去されます。
@@ -109,7 +108,6 @@ vtotp init
 # 保存先パス・表示言語を引数で直接指定する場合（-k / --key、-l / --lang、対話プロンプトなし）
 vtotp init --key "C:\Users\<user>\OneDrive\個人用 Vault\master.key" -l ja
 vtotp init -k "D:\USB\master.key" -l en
-
 ```
 
 ### 2. サービスの登録 (`add`)
@@ -123,7 +121,6 @@ vtotp add github
 # 引数で直接指定する場合（--secret / -s）
 vtotp add aws --secret JBSWY3DPEHPK3PXP --issuer Amazon
 vtotp add aws -s JBSWY3DPEHPK3PXP --issuer Amazon
-
 ```
 
 ### 3. TOTP コードの生成 (`generate`、エイリアス: `get` / `-g`、省略形)
@@ -143,7 +140,6 @@ vtotp -g github
 
 # クリップボードへ直接コピー（PowerShell）
 vtotp github | Set-Clipboard
-
 ```
 
 ### 4. サービス一覧の確認 (`list`、エイリアス: `ls`)
@@ -152,9 +148,7 @@ vtotp github | Set-Clipboard
 
 ```powershell
 vtotp list
-# ls は list のエイリアス
 vtotp ls
-
 ```
 
 ### 5. サービスの削除 (`remove`、エイリアス: `rm`)
@@ -171,7 +165,6 @@ vtotp remove github -f
 
 # rm は remove のエイリアス（動作は同じ）
 vtotp rm github --force
-
 ```
 
 ### 6. マスターキーのローテーション (`rekey`)
@@ -180,7 +173,6 @@ vtotp rm github --force
 
 ```powershell
 vtotp rekey
-
 ```
 
 ---
@@ -189,8 +181,8 @@ vtotp rekey
 
 vtotp のコマンドラインは、パイプ連携やスクリプト組み込み時の予測可能性を重視し、次の 2 原則に従います。
 
-1. **第一引数の固定**: 第一引数は必ず「予約サブコマンド」または「サービス名（省略形）」であり、`-h` / `--help` / `--version` を除き、オプションを先頭に置くことはできません。
-2. **オプションの後置**: `SERVICE` を必要とするコマンド（`generate` / `get` / `add` / `remove` / `rm`）では、サブコマンド直後に必ず `SERVICE` を置き、オプションはその後方にのみ指定できます。
+1. **第一引数の固定**: 第一引数は必ず「予約サブコマンド」または「サービス名（省略形）」であり、`-h` / `--help` / `--version` を除き、オプションは後方に置きます。
+2. **オプションの後置**: `SERVICE` を必要とするコマンド（`generate` / `get` / `add` / `remove` / `rm`）では、サブコマンド直後に必ず `SERVICE` を置き、オプションはその後方に指定します。
 
 ```powershell
 # 正しい例（SERVICEがサブコマンド直後、オプションは後方・順不同）
@@ -200,7 +192,6 @@ vtotp get github --key "PATH" -l ja
 # 非サポート（終了コード 2 で拒否される）
 vtotp get -l ja github
 vtotp get --key "PATH" github
-
 ```
 
 ---
@@ -222,7 +213,6 @@ vtotp github -l ja
 
 # 環境変数で恒久的に切り替え（シェルの設定ファイル等に記述）
 $env:VTOTP_LANG = "ja"
-
 ```
 
 ### 言語設定の確認・恒久的な変更 (`config`)
@@ -236,7 +226,6 @@ vtotp config -l ja
 
 # 言語設定を config.json へ恒久的に保存（標準構文。上記と完全に同じ動作）
 vtotp config set language en
-
 ```
 
 `config -l <en|ja>` と `config set language <en|ja>` は完全に等価な動作（保存内容・表示メッセージ・終了コード）をします。日常的な切り替えには短いショートカット構文が便利です。
@@ -257,7 +246,6 @@ vtotp config set language en
 
 ```powershell
 vtotp config
-
 ```
 
 ---
@@ -279,45 +267,12 @@ vtotp config
 
 ---
 
-## 開発とテスト
+## 開発とビルド
 
-本プロジェクトはテスト駆動開発（TDD）に基づき、全テストの通過と 100% カバレッジ、厳格な静的解析を維持しています。
+- 開発環境の構築やテスト実行手順: [CONTRIBUTING.md](CONTRIBUTING.md)
+- 配布バイナリのビルドやCI仕様: [docs/BUILD.md](docs/BUILD.md)
 
-```powershell
-# テスト用依存パッケージを含めて編集可能モードでインストール
-pip install -e ".[dev]"
-
-# 全単体・統合テストの実行（カバレッジ計測）
-python -m pytest --cov=src/vtotp --cov-report=term-missing
-
-# 静的解析（flake8の設定はリポジトリルートの .flake8 から自動的に読み込まれる）
-python -m flake8 src tests
-python -m mypy src
-python -m black --check src tests
-
-```
-
-`flake8` はリポジトリルートの [`.flake8`](.flake8) 設定（`max-line-length = 88` / `extend-ignore = E203, W503`）に従って実行され、Black のフォーマット結果と競合しません。
-
-現時点での検証実績: **655 passed, 1 skipped**（Windows では `os.chmod` による権限剥奪を検証する1件のみ既定でスキップ）、カバレッジ **100%**。`flake8` / `mypy` / `black --check` はいずれも警告ゼロです。テストスイートは OS ロケールや `VTOTP_LANG`/`LANG`/`LC_ALL` 環境変数から隔離されており、実行環境に依存せず安定して再現します。
-
-### バイナリビルド（ハイブリッド配布）
-
-配布用バイナリ（Standalone ZIP 版・Onefile EXE 版）は、いずれも **Nuitka** でビルドします。
-
-```powershell
-# ビルド用依存パッケージ（nuitka, zstandard）を含めて編集可能モードでインストール
-pip install -e ".[build]"
-
-# ① Standalone版（フォルダ一式）のビルド
-python -m nuitka --standalone --assume-yes-for-downloads --output-dir=dist/standalone --output-filename=vtotp --include-package=vtotp --include-package=cryptography src/vtotp/__main__.py
-
-# ② Onefile版（単一ファイル）のビルド
-python -m nuitka --standalone --onefile --assume-yes-for-downloads --output-dir=dist/onefile --output-filename=vtotp --include-package=vtotp --include-package=cryptography src/vtotp/__main__.py
-
-```
-
-CI（[`.github/workflows/release.yml`](.github/workflows/release.yml)）ではタグ `v*` の push を起点に、両形態をビルドし、Windows PE メタデータ（会社名・製品名・バージョン・説明文・著作権）の埋め込み、`--version` / `--help` / `init` のスモークテスト、SHA-256 チェックサムの生成・検証を行った上で、GitHub Release へ **Pre-release** として自動公開します。誤検知除外申請・実機検証が完了した時点で、再ビルドなしに正式リリース（Latest）へ手動昇格します。詳細なビルドパラメータの設計根拠は [`docs/DESIGN.md`](docs/DESIGN.md) の Section 18・22 を参照してください。
+本プロジェクトは継続的にテスト・静的解析・ビルド検証を整備しており、カバレッジ 100% と警告ゼロを維持する方針です。
 
 ---
 
