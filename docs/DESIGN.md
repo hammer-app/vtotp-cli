@@ -127,7 +127,7 @@ JSON全体を暗号化し、ファイルにはメタデータと暗号文だけ�
 ```text
 - Python標準ライブラリで追加依存が不要
 - Windows / Linux / macOSで動作差が少ない
-- -g、-k、--secret、--forceなどを明確に定義できる
+- -g、-k、--stdin、--forceなどを明確に定義できる
 - サブコマンドとエイリアスを細かく制御できる
 - vtotp <service> の独自フォールバック処理を実装しやすい
 - CLIの挙動を予測しやすい
@@ -652,8 +652,7 @@ vtotp generate SERVICE [--key PATH] [--storage PATH]
 vtotp get SERVICE [--key PATH] [--storage PATH]
 vtotp -g SERVICE [--key PATH] [--storage PATH]
 
-vtotp add SERVICE [--secret SECRET] [--issuer ISSUER]
-                  [--key PATH] [--storage PATH]
+vtotp add SERVICE [--issuer ISSUER] [--stdin] [--key PATH] [--storage PATH]
 
 vtotp remove SERVICE [--force]
                     [--key PATH] [--storage PATH]
@@ -881,6 +880,8 @@ CliHandler
     -> KeyManager.load_key()
     -> SecureStorage.load()
     -> SecretInputReader.read_secret()
+         --stdin指定時: 標準入力から読み込み、改行を除去する（マスキングなし）
+         --stdin未指定時: ターミナルからマスキング入力し、空入力時はキャンセルする
     -> TotpGenerator.validate_secret()
     -> ServiceRegistry.add_or_update()
     -> SecureStorage.save()
@@ -1004,8 +1005,7 @@ CliHandler
 
 - 秘密情報を例外メッセージ、デバッグログ、argparseのusage表示へ混入させない。
 
-- --secretで渡した値はOSのプロセス一覧やシェル履歴に残る可能性があるため、
-  未指定時の対話入力を推奨する。
+- コマンドライン引数による平文シークレットの直接受け渡しは全面的に廃止・禁止し、シェル履歴、OSのプロセス一覧、プロセス監査ログへの露出を根本排除する。
 
 - 暗号化ファイルには認証付き暗号を使用する。
 
@@ -1312,7 +1312,7 @@ vtotp <command-or-service> [SERVICE] [options...]
 vtotp init [--key PATH] [--lang en|ja]
 vtotp generate SERVICE [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp get SERVICE [--key PATH] [--storage PATH] [--lang en|ja]
-vtotp add SERVICE [--secret SECRET] [--issuer ISSUER] [--key PATH] [--storage PATH] [--lang en|ja]
+vtotp add SERVICE [--issuer ISSUER] [--stdin] [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp remove SERVICE [--force] [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp list [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp rekey [--key PATH] [--storage PATH] [--lang en|ja]
