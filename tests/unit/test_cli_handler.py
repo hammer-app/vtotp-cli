@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import getpass
 import io
 import json
 import os
@@ -56,12 +57,17 @@ def handler_factory(
 ) -> Callable[..., CliHandler]:
     """注入済みストリーム・一時config.jsonを持つCliHandlerを生成するファクトリを返す。"""
 
-    def _factory(responses: list[str] | None = None) -> CliHandler:
+    def _factory(responses: list[str] | None = None, stdin: str = "") -> CliHandler:
+        # 通常の対話入力とシークレットのマスキング入力は、同じ応答列を
+        # 呼び出し順に消費する（実運用の入力順序をそのまま再現する）。
+        input_func = _make_input(responses or [])
         return CliHandler(
             stdout=stdout,
             stderr=stderr,
             config_path=config_path,
-            input_func=_make_input(responses or []),
+            input_func=input_func,
+            secret_input_func=input_func,
+            stdin=io.StringIO(stdin),
         )
 
     return _factory
@@ -361,10 +367,8 @@ class TestInitCommand:
         assert not Path(quoted_key_path).exists()
 
         # `-k`で作成した鍵を、同じく`-k`＋クォート付きパスで読み込めることも確認する。
-        add_handler = handler_factory()
-        exit_code = add_handler.run(
-            ["add", "github", "-k", quoted_key_path, "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        exit_code = add_handler.run(["add", "github", "-k", quoted_key_path, "--stdin"])
         assert exit_code == 0
 
     def test_storage_option_strips_surrounding_quotes(
@@ -392,7 +396,7 @@ class TestInitCommand:
         # （`init`は`--storage`を受け付けないため）。
         SecureStorage().initialize(custom_storage, key_path.read_bytes())
 
-        add_handler = handler_factory()
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         exit_code = add_handler.run(
             [
                 "add",
@@ -401,8 +405,7 @@ class TestInitCommand:
                 str(key_path),
                 "--storage",
                 quoted_storage,
-                "--secret",
-                "JBSWY3DPEHPK3PXP",
+                "--stdin",
             ]
         )
         assert exit_code == 0
@@ -597,15 +600,14 @@ class TestGenerateCommand:
     def _add_github(
         self, handler_factory: Callable[..., CliHandler], key_path: Path
     ) -> None:
-        handler = handler_factory()
+        handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         exit_code = handler.run(
             [
                 "add",
                 "github",
                 "--key",
                 str(key_path),
-                "--secret",
-                "JBSWY3DPEHPK3PXP",
+                "--stdin",
                 "--issuer",
                 "GitHub",
             ]
@@ -793,32 +795,215 @@ class TestGenerateCommand:
 class TestAddCommand:
     """`add` サブコマンドに関するテスト。"""
 
-    def test_add_with_secret_flag_registers_service(
+    @staticmethod
+    def _load_records(config_path: Path, key_path: Path) -> dict[str, SecretRecord]:
+        """既定の暗号化データファイルから登録済みレコードを直接読み出す。"""
+        return SecureStorage().load_secrets(
+            config_path.parent / "vtotp-secrets.enc", key_path.read_bytes()
+        )
+
+    @pytest.mark.parametrize(
+        "payload",
+        ["JBSWY3DPEHPK3PXP", "JBSWY3DPEHPK3PXP\n", "JBSWY3DPEHPK3PXP\r\n"],
+    )
+    def test_add_with_stdin_registers_service(
         self,
         handler_factory: Callable[..., CliHandler],
         initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        payload: str,
     ) -> None:
-        """--secretで指定したシークレットでサービスが登録されることを確認する。"""
+        """`--stdin`で標準入力から読み込んだシークレットでサービスが登録され、
+        末尾の改行（LF/CRLF）が除去されることを確認する。
+        """
         _, key_path = initialized_handler
-        handler = handler_factory()
+        handler = handler_factory(stdin=payload)
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 0
+
+        records = self._load_records(config_path, key_path)
+        assert records["github"].secret == "JBSWY3DPEHPK3PXP"
+        assert records["github"].issuer is None
+
+    def test_add_with_stdin_and_issuer_registers_issuer(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+    ) -> None:
+        """`--stdin`と`--issuer`を併用した場合、発行者名も登録されることを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         exit_code = handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
+            ["add", "github", "--issuer", "GitHub", "--stdin", "--key", str(key_path)]
         )
         assert exit_code == 0
 
-        list_handler = handler_factory()
-        list_handler.run(["list", "--key", str(key_path)])
+        records = self._load_records(config_path, key_path)
+        assert records["github"].issuer == "GitHub"
 
-    def test_add_prompts_for_secret_when_omitted(
+    def test_add_with_stdin_does_not_show_interactive_prompt(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stderr: io.StringIO,
+    ) -> None:
+        """`--stdin`指定時は対話プロンプトを表示・使用せず、標準入力の値を採用することを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(["KRSXG5CTMVRXEZLU"], stdin="JBSWY3DPEHPK3PXP\n")
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 0
+
+        assert "Enter the TOTP secret" not in stderr.getvalue()
+        records = self._load_records(config_path, key_path)
+        assert records["github"].secret == "JBSWY3DPEHPK3PXP"
+
+    @pytest.mark.parametrize("payload", ["", "\n", "\r\n", "\n\n", "\r\n\r\n"])
+    def test_add_with_empty_stdin_returns_exit_code_6(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stderr: io.StringIO,
+        payload: str,
+    ) -> None:
+        """`--stdin`で空文字列・改行のみが渡された場合、キャンセル(7)ではなく
+        不正なシークレット（終了コード6）として扱われ、何も登録されないことを確認する。
+        """
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin=payload)
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 6
+        assert "TOTP secret is empty" in stderr.getvalue()
+        assert "Traceback" not in stderr.getvalue()
+        assert self._load_records(config_path, key_path) == {}
+
+    def test_add_with_whitespace_only_stdin_returns_exit_code_6(
         self,
         handler_factory: Callable[..., CliHandler],
         initialized_handler: tuple[CliHandler, Path],
     ) -> None:
-        """--secret省略時に対話入力でシークレットを取得することを確認する。"""
+        """`--stdin`で空白のみが渡された場合も、終了コード6になることを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin="   \n")
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 6
+
+    def test_add_with_undecodable_stdin_returns_exit_code_6(
+        self,
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+    ) -> None:
+        """標準入力がテキストとしてデコードできない場合、トレースバックや入力内容を
+        出力せずに終了コード6になることを確認する（Zero Leakage Rule）。
+        """
+        _, key_path = initialized_handler
+        handler = CliHandler(
+            stdout=stdout,
+            stderr=stderr,
+            config_path=config_path,
+            stdin=io.TextIOWrapper(io.BytesIO(b"\xff\xfeJBSWY3DPEHPK3PXP"), "utf-8"),
+        )
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 6
+
+        combined = stdout.getvalue() + stderr.getvalue()
+        assert "Traceback" not in combined
+        assert "JBSWY3DPEHPK3PXP" not in combined
+        assert "0xff" not in combined
+
+    @pytest.mark.parametrize(
+        "secret_args",
+        [
+            ["--secret", "JBSWY3DPEHPK3PXP"],
+            ["-s", "JBSWY3DPEHPK3PXP"],
+            ["--secret=JBSWY3DPEHPK3PXP"],
+            ["-sJBSWY3DPEHPK3PXP"],
+        ],
+    )
+    def test_removed_secret_option_returns_exit_code_2(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stderr: io.StringIO,
+        secret_args: list[str],
+    ) -> None:
+        """廃止された`--secret`/`-s`が未知の引数として終了コード2で拒否され、
+        対話プロンプトも表示されず、何も登録されないことを確認する。
+        """
+        _, key_path = initialized_handler
+        handler = handler_factory(["KRSXG5CTMVRXEZLU"])
+        exit_code = handler.run(["add", "github", "--key", str(key_path), *secret_args])
+        assert exit_code == 2
+        assert "Enter the TOTP secret" not in stderr.getvalue()
+        assert self._load_records(config_path, key_path) == {}
+
+    def test_add_prompts_for_secret_when_stdin_option_omitted(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stderr: io.StringIO,
+    ) -> None:
+        """`--stdin`未指定時にプロンプトをstderrへ表示し、対話入力でシークレットを取得することを確認する。"""
         _, key_path = initialized_handler
         handler = handler_factory(["JBSWY3DPEHPK3PXP"])
         exit_code = handler.run(["add", "github", "--key", str(key_path)])
         assert exit_code == 0
+        assert "Enter the TOTP secret" in stderr.getvalue()
+
+        records = self._load_records(config_path, key_path)
+        assert records["github"].secret == "JBSWY3DPEHPK3PXP"
+
+    def test_interactive_secret_prompt_uses_masked_getpass_by_default(
+        self,
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`secret_input_func`未注入時、シークレットの対話入力にエコー無しの
+        `getpass.getpass`が使われ、入力値が画面へ出力されないことを確認する。
+        """
+        _, key_path = initialized_handler
+        calls: list[str] = []
+
+        def _fake_getpass(prompt: str = "Password: ", stream: object = None) -> str:
+            calls.append(prompt)
+            return "JBSWY3DPEHPK3PXP"
+
+        monkeypatch.setattr(getpass, "getpass", _fake_getpass)
+        handler = CliHandler(stdout=stdout, stderr=stderr, config_path=config_path)
+        exit_code = handler.run(["add", "github", "--key", str(key_path)])
+        assert exit_code == 0
+
+        # プロンプト文言はCliHandler自身がstderrへ表示し、getpassには空文字列を渡す。
+        assert calls == [""]
+        assert "Enter the TOTP secret" in stderr.getvalue()
+        assert "JBSWY3DPEHPK3PXP" not in stdout.getvalue() + stderr.getvalue()
+
+    def test_stdin_option_reads_sys_stdin_by_default(
+        self,
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`stdin`未注入時、`--stdin`が`sys.stdin`から読み込むことを確認する。"""
+        _, key_path = initialized_handler
+        monkeypatch.setattr(sys, "stdin", io.StringIO("JBSWY3DPEHPK3PXP\n"))
+        handler = CliHandler(stdout=stdout, stderr=stderr, config_path=config_path)
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 0
+
+        records = self._load_records(config_path, key_path)
+        assert records["github"].secret == "JBSWY3DPEHPK3PXP"
 
     def test_add_cancelled_when_secret_prompt_is_empty(
         self,
@@ -838,10 +1023,8 @@ class TestAddCommand:
     ) -> None:
         """不正な形式のシークレットの場合、終了コード6になることを確認する。"""
         _, key_path = initialized_handler
-        handler = handler_factory()
-        exit_code = handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "not-valid-base32!!!"]
-        )
+        handler = handler_factory(stdin="not-valid-base32!!!\n")
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
         assert exit_code == 6
 
     def test_add_duplicate_service_returns_exit_code_1(
@@ -851,7 +1034,7 @@ class TestAddCommand:
     ) -> None:
         """重複登録の場合、終了コード1（一般エラー）になることを確認する。"""
         _, key_path = initialized_handler
-        first = handler_factory()
+        first = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         assert (
             first.run(
                 [
@@ -859,17 +1042,14 @@ class TestAddCommand:
                     "github",
                     "--key",
                     str(key_path),
-                    "--secret",
-                    "JBSWY3DPEHPK3PXP",
+                    "--stdin",
                 ]
             )
             == 0
         )
 
-        second = handler_factory()
-        exit_code = second.run(
-            ["add", "github", "--key", str(key_path), "--secret", "KRSXG5CTMVRXEZLU"]
-        )
+        second = handler_factory(stdin="KRSXG5CTMVRXEZLU\n")
+        exit_code = second.run(["add", "github", "--key", str(key_path), "--stdin"])
         assert exit_code == 1
 
     def test_add_output_never_leaks_the_secret_value(
@@ -881,10 +1061,8 @@ class TestAddCommand:
     ) -> None:
         """addの標準出力・標準エラー出力に、渡したシークレットの値が含まれないことを確認する。"""
         _, key_path = initialized_handler
-        handler = handler_factory()
-        handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        handler.run(["add", "github", "--key", str(key_path), "--stdin"])
         combined = stdout.getvalue() + stderr.getvalue()
         assert "JBSWY3DPEHPK3PXP" not in combined
 
@@ -897,7 +1075,7 @@ class TestAddCommand:
     ) -> None:
         """重複登録（終了コード1）の際、入力したシークレットがstdout/stderrに現れないことを確認する。"""
         _, key_path = initialized_handler
-        first = handler_factory()
+        first = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         assert (
             first.run(
                 [
@@ -905,8 +1083,7 @@ class TestAddCommand:
                     "github",
                     "--key",
                     str(key_path),
-                    "--secret",
-                    "JBSWY3DPEHPK3PXP",
+                    "--stdin",
                 ]
             )
             == 0
@@ -916,10 +1093,8 @@ class TestAddCommand:
         stderr.truncate(0)
         stderr.seek(0)
 
-        second = handler_factory()
-        exit_code = second.run(
-            ["add", "github", "--key", str(key_path), "--secret", "KRSXG5CTMVRXEZLU"]
-        )
+        second = handler_factory(stdin="KRSXG5CTMVRXEZLU\n")
+        exit_code = second.run(["add", "github", "--key", str(key_path), "--stdin"])
         assert exit_code == 1
 
         combined = stdout.getvalue() + stderr.getvalue()
@@ -937,10 +1112,8 @@ class TestAddCommand:
         _, key_path = initialized_handler
         invalid_secret = "not-valid-base32!!!"
 
-        handler = handler_factory()
-        exit_code = handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", invalid_secret]
-        )
+        handler = handler_factory(stdin=f"{invalid_secret}\n")
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
         assert exit_code == 6
 
         combined = stdout.getvalue() + stderr.getvalue()
@@ -971,10 +1144,8 @@ class TestListCommand:
     ) -> None:
         """登録済みサービス名が一覧に含まれ、シークレットは含まれないことを確認する。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "--key", str(key_path), "--stdin"])
 
         list_handler = handler_factory()
         exit_code = list_handler.run(["list", "--key", str(key_path)])
@@ -990,10 +1161,8 @@ class TestListCommand:
     ) -> None:
         """`ls`エイリアスが`list`と同じ結果になることを確認する。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "--key", str(key_path), "--stdin"])
 
         ls_handler = handler_factory()
         exit_code = ls_handler.run(["ls", "--key", str(key_path)])
@@ -1007,10 +1176,8 @@ class TestRemoveCommand:
     def _add_github(
         self, handler_factory: Callable[..., CliHandler], key_path: Path
     ) -> None:
-        handler = handler_factory()
-        handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        handler.run(["add", "github", "--key", str(key_path), "--stdin"])
 
     def test_remove_with_force_skips_confirmation(
         self,
@@ -1098,10 +1265,8 @@ class TestRekeyCommand:
     ) -> None:
         """rekey後、新しい鍵でサービス情報が読み込めることを確認する。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "--key", str(key_path), "--stdin"])
         old_key_bytes = key_path.read_bytes()
 
         rekey_handler = handler_factory()
@@ -1140,8 +1305,8 @@ class TestRekeyCommand:
         旧鍵・暗号化データがそのまま利用可能であることを確認する（フェイルセーフ）。
         """
         _, key_path = initialized_handler
-        handler_factory().run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
+        handler_factory(stdin="JBSWY3DPEHPK3PXP\n").run(
+            ["add", "github", "--key", str(key_path), "--stdin"]
         )
         old_key_bytes = key_path.read_bytes()
 
@@ -1220,10 +1385,8 @@ class TestShortKeyOption:
     ) -> None:
         """`generate -k PATH SERVICE`が正しく鍵パスを解決してコードを生成することを確認する。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "-k", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "-k", str(key_path), "--stdin"])
 
         handler = handler_factory()
         exit_code = handler.run(["generate", "github", "-k", str(key_path)])
@@ -1237,10 +1400,8 @@ class TestShortKeyOption:
     ) -> None:
         """`add -k PATH SERVICE`が正しく鍵パスを解決してサービスを登録できることを確認する。"""
         _, key_path = initialized_handler
-        handler = handler_factory()
-        exit_code = handler.run(
-            ["add", "github", "-k", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        exit_code = handler.run(["add", "github", "-k", str(key_path), "--stdin"])
         assert exit_code == 0
 
     def test_list_accepts_short_key_option(
@@ -1251,10 +1412,8 @@ class TestShortKeyOption:
     ) -> None:
         """`list -k PATH`が正しく鍵パスを解決してサービス一覧を表示できることを確認する。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "-k", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "-k", str(key_path), "--stdin"])
 
         handler = handler_factory()
         exit_code = handler.run(["list", "-k", str(key_path)])
@@ -1268,10 +1427,8 @@ class TestShortKeyOption:
     ) -> None:
         """`remove -k PATH SERVICE`が正しく鍵パスを解決してサービスを削除できることを確認する。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "-k", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "-k", str(key_path), "--stdin"])
 
         handler = handler_factory()
         exit_code = handler.run(["remove", "github", "--force", "-k", str(key_path)])
@@ -1570,7 +1727,7 @@ class TestConfigFileHandling:
         custom_storage = tmp_path / "custom" / "secrets.enc"
         SecureStorage().initialize(custom_storage, key_path.read_bytes())
 
-        add_handler = handler_factory()
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         exit_code = add_handler.run(
             [
                 "add",
@@ -1579,8 +1736,7 @@ class TestConfigFileHandling:
                 str(key_path),
                 "--storage",
                 str(custom_storage),
-                "--secret",
-                "JBSWY3DPEHPK3PXP",
+                "--stdin",
             ]
         )
         assert exit_code == 0
@@ -1612,9 +1768,9 @@ class TestConfigFileHandling:
         config["storage_path"] = str(custom_storage)
         config_path.write_text(json.dumps(config), encoding="utf-8")
 
-        add_handler = handler_factory()
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
         exit_code = add_handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
+            ["add", "github", "--key", str(key_path), "--stdin"]
         )
         assert exit_code == 0
         assert custom_storage.is_file()
@@ -1961,10 +2117,8 @@ class TestPrePositionedOptionRejection:
     ) -> None:
         """サブコマンドの後方に置かれたオプションは正常に受理されることを確認する（対照テスト）。"""
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "--key", str(key_path), "--stdin"])
 
         handler = handler_factory()
         exit_code = handler.run(["get", "github", "--key", str(key_path)])
@@ -1989,7 +2143,7 @@ class TestServicePositionStrictness:
             ["generate", "-l", "ja", "github"],
             ["generate", "--storage", "PATH", "github"],
             ["add", "--issuer", "X", "github"],
-            ["add", "-s", "JBSWY3DPEHPK3PXP", "github"],
+            ["add", "--stdin", "github"],
             ["remove", "--force", "github"],
             ["remove", "-k", "PATH", "github"],
             ["rm", "--force", "github"],
@@ -2025,7 +2179,7 @@ class TestServicePositionStrictness:
         [
             ["get", "github", "--key", "PATH"],
             ["generate", "github", "-l", "ja"],
-            ["add", "github", "--issuer", "X", "--secret", "JBSWY3DPEHPK3PXP"],
+            ["add", "github", "--issuer", "X", "--stdin"],
             ["remove", "github", "--force"],
         ],
     )
@@ -2040,10 +2194,8 @@ class TestServicePositionStrictness:
         後続の解析・実行結果を妨げないことの対照テスト）。
         """
         _, key_path = initialized_handler
-        add_handler = handler_factory()
-        add_handler.run(
-            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
-        )
+        add_handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        add_handler.run(["add", "github", "--key", str(key_path), "--stdin"])
 
         # `PATH`プレースホルダーを実際の一時鍵パスへ差し替える。
         resolved_argv = [str(key_path) if token == "PATH" else token for token in argv]

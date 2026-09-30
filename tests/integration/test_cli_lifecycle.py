@@ -32,6 +32,7 @@ def _run_cli(
     home_dir: Path,
     extra_env: dict[str, str] | None = None,
     force_lang: str | None = "en",
+    stdin_text: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """``python -m vtotp`` をサブプロセスとして実行し、結果を返す。
 
@@ -49,8 +50,9 @@ def _run_cli(
     まま）実際に解決へ反映されることそのものを検証したい場合は
     ``force_lang=None``を渡し、``VTOTP_LANG``を一切注入しない。
 
-    プロンプトが誤って発生した場合にサブプロセスが無限に待機しないよう、
-    標準入力には常に空文字列を渡す（即座にEOFとして扱われる）。
+    ``add --stdin`` でシークレットを渡す場合は ``stdin_text`` を指定する。
+    それ以外は、プロンプトが誤って発生した場合にサブプロセスが無限に
+    待機しないよう、標準入力には空文字列を渡す（即座にEOFとして扱われる）。
     """
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
@@ -71,7 +73,7 @@ def _run_cli(
         capture_output=True,
         text=True,
         encoding="utf-8",
-        input="",
+        input=stdin_text,
         timeout=_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
@@ -94,8 +96,10 @@ class TestFullLifecycle:
         key_path = tmp_path / "master.key"
         session_log: list[subprocess.CompletedProcess[str]] = []
 
-        def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-            result = _run_cli(args, home_dir)
+        def run(
+            args: Sequence[str], stdin_text: str = ""
+        ) -> subprocess.CompletedProcess[str]:
+            result = _run_cli(args, home_dir, stdin_text=stdin_text)
             session_log.append(result)
             return result
 
@@ -117,15 +121,18 @@ class TestFullLifecycle:
                 "github",
                 "--key",
                 str(key_path),
-                "--secret",
-                _GITHUB_SECRET,
+                "--stdin",
                 "--issuer",
                 "GitHub",
-            ]
+            ],
+            stdin_text=f"{_GITHUB_SECRET}\n",
         )
         assert result.returncode == 0, result.stderr
 
-        result = run(["add", "aws", "--key", str(key_path), "--secret", _AWS_SECRET])
+        result = run(
+            ["add", "aws", "--key", str(key_path), "--stdin"],
+            stdin_text=f"{_AWS_SECRET}\r\n",
+        )
         assert result.returncode == 0, result.stderr
 
         # 3. list: 昇順・シークレット非表示で一覧が出力されることを確認する。
@@ -208,8 +215,9 @@ class TestArgumentAndEnvironmentIntegration:
         assert _run_cli(["init", "-k", str(key_path)], home_dir).returncode == 0
         assert (
             _run_cli(
-                ["add", "github", "-k", str(key_path), "--secret", _GITHUB_SECRET],
+                ["add", "github", "-k", str(key_path), "--stdin"],
                 home_dir,
+                stdin_text=f"{_GITHUB_SECRET}\n",
             ).returncode
             == 0
         )
@@ -229,8 +237,9 @@ class TestArgumentAndEnvironmentIntegration:
         assert _run_cli(["init", "-k", str(key_path)], home_dir).returncode == 0
         assert (
             _run_cli(
-                ["add", "github", "-k", str(key_path), "--secret", _GITHUB_SECRET],
+                ["add", "github", "-k", str(key_path), "--stdin"],
                 home_dir,
+                stdin_text=f"{_GITHUB_SECRET}\n",
             ).returncode
             == 0
         )
@@ -253,8 +262,9 @@ class TestArgumentAndEnvironmentIntegration:
         env_override = {"VTOTP_KEY_PATH": str(key_path)}
 
         result = _run_cli(
-            ["add", "github", "--secret", _GITHUB_SECRET],
+            ["add", "github", "--stdin"],
             home_dir,
+            stdin_text=f"{_GITHUB_SECRET}\n",
             extra_env=env_override,
         )
         assert result.returncode == 0, result.stderr
@@ -311,12 +321,54 @@ class TestErrorHandlingExitCodes:
 
         invalid_secret = "not-valid-base32!!!"
         result = _run_cli(
-            ["add", "github", "--key", str(key_path), "--secret", invalid_secret],
+            ["add", "github", "--key", str(key_path), "--stdin"],
             home_dir,
+            stdin_text=f"{invalid_secret}\n",
         )
         assert result.returncode == 6
         assert invalid_secret not in result.stdout
         assert invalid_secret not in result.stderr
+
+    @pytest.mark.parametrize("stdin_text", ["", "\n"])
+    def test_add_with_empty_stdin_returns_exit_code_6(
+        self, home_dir: Path, tmp_path: Path, stdin_text: str
+    ) -> None:
+        """`--stdin`へ空入力・改行のみを渡したaddが終了コード6になり、何も登録されないことを確認する。"""
+        key_path = tmp_path / "master.key"
+        assert _run_cli(["init", "--key", str(key_path)], home_dir).returncode == 0
+
+        result = _run_cli(
+            ["add", "github", "--key", str(key_path), "--stdin"],
+            home_dir,
+            stdin_text=stdin_text,
+        )
+        assert result.returncode == 6
+        assert "Traceback" not in result.stderr
+
+        result = _run_cli(["list", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        assert "github" not in result.stdout
+
+    @pytest.mark.parametrize("secret_option", ["--secret", "-s"])
+    def test_removed_secret_option_returns_exit_code_2(
+        self, home_dir: Path, tmp_path: Path, secret_option: str
+    ) -> None:
+        """廃止された`--secret`/`-s`を指定したaddが、実プロセス実行でも終了コード2で
+        拒否され、サービスが登録されないことを確認する。
+        """
+        key_path = tmp_path / "master.key"
+        assert _run_cli(["init", "--key", str(key_path)], home_dir).returncode == 0
+
+        result = _run_cli(
+            ["add", "github", "--key", str(key_path), secret_option, _GITHUB_SECRET],
+            home_dir,
+        )
+        assert result.returncode == 2
+        assert "Traceback" not in result.stderr
+
+        result = _run_cli(["list", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        assert "github" not in result.stdout
 
     def test_corrupted_storage_returns_exit_code_4(
         self, home_dir: Path, tmp_path: Path
@@ -326,8 +378,9 @@ class TestErrorHandlingExitCodes:
         assert _run_cli(["init", "--key", str(key_path)], home_dir).returncode == 0
         assert (
             _run_cli(
-                ["add", "github", "--key", str(key_path), "--secret", _GITHUB_SECRET],
+                ["add", "github", "--key", str(key_path), "--stdin"],
                 home_dir,
+                stdin_text=f"{_GITHUB_SECRET}\n",
             ).returncode
             == 0
         )

@@ -10,6 +10,7 @@ TOTPシークレットや鍵の内容はいかなる場合もstdout/stderrへ出
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ from vtotp.core.totp_generator import TotpGenerator
 from vtotp.domain.exceptions import (
     CancelledError,
     CommandParseError,
+    InvalidSecretError,
     KeyNotFoundError,
     TotpCliError,
 )
@@ -50,6 +52,18 @@ _LANG_CHOICES: list[str] = list(SUPPORTED_LANGUAGES)
 
 #: パスの前後引用符として認識する文字。
 _QUOTE_CHARS = "\"'"
+
+#: `add --stdin` で読み込んだシークレットの末尾から除去する改行文字。
+_TRAILING_NEWLINE_CHARS = "\r\n"
+
+
+def _read_masked_input() -> str:
+    """入力内容をエコーせずに（マスキングして）1行を読み込む。
+
+    プロンプト文言は呼び出し元がstderrへ表示するため、`getpass`自体には
+    空のプロンプトを渡す。
+    """
+    return getpass.getpass(prompt="")
 
 
 def _strip_quotes(value: str, language: str) -> str:
@@ -158,13 +172,16 @@ class CliHandler:
         stderr: IO[str] | None = None,
         input_func: Callable[[], str] | None = None,
         config_path: Path | None = None,
+        stdin: IO[str] | None = None,
+        secret_input_func: Callable[[], str] | None = None,
     ) -> None:
         """依存コンポーネントと入出力ストリームを設定する。
 
         いずれの引数も省略可能で、省略時は実運用向けの既定値（実際の
-        コアコンポーネント、``sys.stdout``/``sys.stderr``、組み込みの
-        ``input``、既定のconfig.jsonパス）が使用される。テストからは
-        これらを注入してふるまいを検証できる。
+        コアコンポーネント、``sys.stdin``/``sys.stdout``/``sys.stderr``、
+        組み込みの ``input``、マスキング入力（``getpass``）、既定の
+        config.jsonパス）が使用される。テストからはこれらを注入して
+        ふるまいを検証できる。
         """
         self._key_manager = key_manager if key_manager is not None else KeyManager()
         self._secure_storage = (
@@ -178,7 +195,11 @@ class CliHandler:
         )
         self._stdout: IO[str] = stdout if stdout is not None else sys.stdout
         self._stderr: IO[str] = stderr if stderr is not None else sys.stderr
+        self._stdin: IO[str] = stdin if stdin is not None else sys.stdin
         self._input: Callable[[], str] = input_func if input_func is not None else input
+        self._secret_input: Callable[[], str] = (
+            secret_input_func if secret_input_func is not None else _read_masked_input
+        )
         self._config_path = (
             config_path if config_path is not None else DEFAULT_CONFIG_PATH
         )
@@ -351,8 +372,11 @@ class CliHandler:
 
         add_parser = subparsers.add_parser("add", help="Register a new service")
         add_parser.add_argument("service")
-        add_parser.add_argument("--secret", "-s", default=None)
+        # シークレットをCLI引数で受け取る`--secret`/`-s`は、シェル履歴・プロセス
+        # 一覧への露出を防ぐため廃止済み（REQUIREMENTS.md 3.4 / 4.1）。指定された
+        # 場合は未知の引数として終了コード2で拒否される。
         add_parser.add_argument("--issuer", default=None)
+        add_parser.add_argument("--stdin", action="store_true")
         add_parser.add_argument("-k", "--key", type=_type_path, default=None)
         add_parser.add_argument("--storage", type=_type_path, default=None)
         add_parser.add_argument("-l", "--lang", choices=_LANG_CHOICES, default=None)
@@ -551,17 +575,39 @@ class CliHandler:
         return normalized if normalized is not None else default_language
 
     def _prompt_for_secret(self) -> str | None:
-        """`add` で `--secret` 未指定時に、TOTPシークレットを対話入力で取得する。"""
+        """`add` で `--stdin` 未指定時に、TOTPシークレットをマスキング対話入力で取得する。
+
+        入力内容は画面にエコーしない。空欄・EOFの場合は ``None`` を返し、
+        呼び出し元でキャンセル扱いとする。
+        """
         print(
             formatter.format_message(MsgKey.ADD_PROMPT_SECRET, self._current_language),
             file=self._stderr,
         )
         try:
-            response = self._input()
+            response = self._secret_input()
         except EOFError:
             return None
         response = response.strip()
         return response if response else None
+
+    def _read_secret_from_stdin(self) -> str:
+        """`add --stdin` 指定時に、標準入力全体からTOTPシークレットを読み込む。
+
+        末尾の改行（CR/LF）のみを除去して返す。パイプ連携向けの経路で
+        あるため、空入力は対話入力のようなキャンセルではなく、不正な
+        シークレットとして :class:`InvalidSecretError` を送出する。デコード
+        できないバイト列が渡された場合も同様に扱い、入力内容は例外へ
+        含めない（Zero Leakage Rule）。
+        """
+        try:
+            raw = self._stdin.read()
+        except UnicodeDecodeError:
+            raise InvalidSecretError(MsgKey.SECRET_INVALID_FORMAT) from None
+        secret = raw.rstrip(_TRAILING_NEWLINE_CHARS)
+        if not secret:
+            raise InvalidSecretError(MsgKey.SECRET_EMPTY)
+        return secret
 
     def _confirm_existing_key_warning(self, path: Path) -> bool:
         """`init` の第1警告：既存鍵ファイルの上書き確認。"""
@@ -653,8 +699,10 @@ class CliHandler:
         key = self._key_manager.load_key(key_path)
         records = self._secure_storage.load_secrets(storage_path, key)
 
-        secret: str | None = args.secret
-        if secret is None:
+        secret: str | None
+        if args.stdin:
+            secret = self._read_secret_from_stdin()
+        else:
             secret = self._prompt_for_secret()
             if secret is None:
                 self._cancel()
