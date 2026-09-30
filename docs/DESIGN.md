@@ -890,9 +890,12 @@ CliHandler
     -> ConfigManager
     -> KeyManager.load_key()
     -> SecureStorage.load()
-    -> SecretInputReader.read_secret()
-         --stdin指定時: 標準入力から読み込み、改行を除去する（マスキングなし）
-         --stdin未指定時: ターミナルからマスキング入力し、空入力時はキャンセルする
+    -> シークレット入力経路の判定
+         --stdin指定時: SecretInputReader.read_secret()
+             標準入力をUTF-8として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾のCR/LF改行を除去する（マスキングなし）
+         --stdin未指定時: 標準入力のTTY判定
+             非TTY: STDIN_OPTION_REQUIREDで終了コード2、対話入力を待たずに終了
+             TTY: SecretInputReader.read_secret()でマスキング入力し、空入力時はキャンセルする
     -> TotpGenerator.validate_secret()
     -> ServiceRegistry.add_or_update()
     -> SecureStorage.save()
@@ -1254,6 +1257,7 @@ class MsgKey(StrEnum):
     INVALID_SECRET = "invalid_secret"
     COMMAND_PARSE_ERROR = "command_parse_error"
     SECRET_ARG_DEPRECATED = "secret_arg_deprecated"
+    STDIN_OPTION_REQUIRED = "stdin_option_required"
     CONFIG_SUMMARY = "config_summary"
     CONFIG_LANGUAGE_UPDATED = "config_language_updated"
 
@@ -1262,10 +1266,12 @@ Catalog = Mapping[MsgKey, str]
 EN_CATALOG: Catalog = {
     # 他のメッセージキーは省略
     MsgKey.SECRET_ARG_DEPRECATED: "The --secret/-s option has been removed for security. Use interactive prompt or --stdin.",
+    MsgKey.STDIN_OPTION_REQUIRED: "Standard input is not a terminal. Use --stdin to pass secrets via pipe or redirect.",
 }
 JA_CATALOG: Catalog = {
     # 他のメッセージキーは省略
     MsgKey.SECRET_ARG_DEPRECATED: "--secret/-s オプションはセキュリティのため廃止されました。対話入力または --stdin を使用してください。",
+    MsgKey.STDIN_OPTION_REQUIRED: "標準入力がターミナルではありません。パイプやリダイレクトでシークレットを渡す場合は --stdin を指定してください。",
 }
 SUPPORTED_LANGUAGES = ("en", "ja")
 ```
@@ -1351,6 +1357,16 @@ CLI引数列全体（`argv`）を `argparse` の解析前に事前走査し、�
 `SECRET_ARG_DEPRECATED`、空のコンテキスト）で直ちに終了する。表示は翻訳済みの固定メッセージ
 だけとし、入力された引数列、値、`argparse` の標準エラー文を含めない。これにより、
 `unrecognized arguments: ...` によるシークレット値のエコーバックを防ぐ。
+
+### 20.4 非TTY環境での `--stdin` 必須化
+
+`add` で `--stdin` が指定されていない場合、シークレットの対話入力へ進む前に標準入力の
+TTY状態を確認する。標準入力がTTYでない（パイプ、リダイレクト、またはTTY判定を提供しない
+入力ストリーム）場合は、`STDIN_OPTION_REQUIRED` を持つ `CommandParseError`（終了コード2、
+空のコンテキスト）を送出し、プロンプトを表示せず即座に終了する。TTYの場合のみ、
+マスキング付きの対話入力を行う。`--stdin` 指定時はこのTTY判定を行わず、標準入力をUTF-8
+として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾CR/LF改行を除去した値を
+Base32形式の検証へ渡す。
 
 ## 21. ドメイン例外と表示層の連携
 
