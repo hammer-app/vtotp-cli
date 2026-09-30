@@ -647,7 +647,8 @@ class CliHandler:
         ...
 ```
 
-`run()` は引数を正規化した後、`add` の引数を `argparse` に渡す前に
+`run()` は引数を正規化した後、実行されたサブコマンドや引数位置（前置・後置）に
+関わらず、CLI引数列全体（`argv`）を `argparse` に渡す前に
 `reject_deprecated_secret_args()` で事前検査する。`--secret` / `-s` が指定されていたら、
 引数列や該当値を表示・ログ出力・例外コンテキストへ複製せず、固定の
 `SECRET_ARG_DEPRECATED` を持つ `CommandParseError` に変換する。これにより、
@@ -1343,8 +1344,9 @@ vtotp config set language en|ja [--lang en|ja]
 
 ### 20.3 廃止シークレット引数の安全な拒否
 
-`add` の引数は `argparse` の解析前に事前走査し、廃止済みの `--secret`、`-s` および
-値を同一トークンに結合した形式（`--secret=VALUE`、`-sVALUE`）を検知する。検知時は
+CLI引数列全体（`argv`）を `argparse` の解析前に事前走査し、実行されるコマンド名や
+引数の指定位置（前置・後置）に関わらず、廃止済みの `--secret`、`-s` および
+値を同一トークンに結合した形式・省略形式（`--secret=VALUE`、`-sVALUE`、`--sec`等）を検知する。検知時は
 `argparse` に引数を渡さず、`CommandParseError`（終了コード2、メッセージキー
 `SECRET_ARG_DEPRECATED`、空のコンテキスト）で直ちに終了する。表示は翻訳済みの固定メッセージ
 だけとし、入力された引数列、値、`argparse` の標準エラー文を含めない。これにより、
