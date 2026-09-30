@@ -887,15 +887,17 @@ CliHandler
 
 ```text
 CliHandler
+    -> --stdin未指定時: 標準入力のTTY判定（鍵・ストレージへのアクセス前）
+         非TTY: STDIN_OPTION_REQUIREDで終了コード2、以降のファイルアクセスを行わず終了
+         TTY: 続行
+    -> --stdin指定時: TTY判定をスキップして続行
     -> ConfigManager
     -> KeyManager.load_key()
     -> SecureStorage.load()
     -> シークレット入力経路の判定
          --stdin指定時: SecretInputReader.read_secret()
              標準入力をUTF-8として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾のCR/LF改行を除去する（マスキングなし）
-         --stdin未指定時: 標準入力のTTY判定
-             非TTY: STDIN_OPTION_REQUIREDで終了コード2、対話入力を待たずに終了
-             TTY: SecretInputReader.read_secret()でマスキング入力し、空入力時はキャンセルする
+         --stdin未指定時（TTY確認済み）: SecretInputReader.read_secret()でマスキング入力し、空入力時はキャンセルする
     -> TotpGenerator.validate_secret()
     -> ServiceRegistry.add_or_update()
     -> SecureStorage.save()
@@ -1361,9 +1363,11 @@ CLI引数列全体（`argv`）を `argparse` の解析前に事前走査し、�
 ### 20.4 非TTY環境での `--stdin` 必須化
 
 `add` で `--stdin` が指定されていない場合、シークレットの対話入力へ進む前に標準入力の
-TTY状態を確認する。標準入力がTTYでない（パイプ、リダイレクト、またはTTY判定を提供しない
-入力ストリーム）場合は、`STDIN_OPTION_REQUIRED` を持つ `CommandParseError`（終了コード2、
-空のコンテキスト）を送出し、プロンプトを表示せず即座に終了する。TTYの場合のみ、
+TTY状態を確認する。この判定は鍵ファイルや暗号化ストレージを読み込む前に行い、標準入力が
+TTYでない（パイプ、リダイレクト、またはTTY判定を提供しない入力ストリーム）場合は、
+鍵ファイルや暗号化ストレージの不在・破損等の状態に関わらず、`STDIN_OPTION_REQUIRED` を持つ
+`CommandParseError`（終了コード2、空のコンテキスト）を送出してプロンプトを表示せず即座に
+終了する。TTYの場合のみ、
 マスキング付きの対話入力を行う。`--stdin` 指定時はこのTTY判定を行わず、標準入力をUTF-8
 として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾CR/LF改行を除去した値を
 Base32形式の検証へ渡す。
