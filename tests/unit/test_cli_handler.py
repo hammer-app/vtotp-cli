@@ -479,14 +479,16 @@ class TestInitCommand:
         assert exit_code == 2
         assert "cannot be empty" in stderr.getvalue()
 
-    def test_invalid_windows_path_characters_return_exit_code_1_without_crashing(
+    def test_invalid_windows_path_characters_return_exit_code_3_without_crashing(
         self,
         handler_factory: Callable[..., CliHandler],
         tmp_path: Path,
         stdout: io.StringIO,
         stderr: io.StringIO,
     ) -> None:
-        """Windowsで不正な文字を含むパスを指定した場合、トレースバックを出さず終了コード1になることを確認する。"""
+        """Windowsで不正な文字を含むパスを指定した場合、トレースバックを出さず
+        鍵保存失敗（KeyStorageError、終了コード3）として扱われることを確認する。
+        """
         if not sys.platform.startswith("win"):
             pytest.skip(
                 "Windows固有の不正パス文字のテストのため、Windows以外ではスキップする"
@@ -497,9 +499,9 @@ class TestInitCommand:
 
         exit_code = handler.run(["init", "--key", str(invalid_key_path)])
 
-        assert exit_code == 1
+        assert exit_code == 3
         assert stdout.getvalue() == ""
-        assert "Error" in stderr.getvalue()
+        assert "Failed to save the key file" in stderr.getvalue()
         # 未処理のPythonトレースバック（"Traceback (most recent call last)"）が
         # stderrへ現れていないことを確認する。
         assert "Traceback" not in stderr.getvalue()
@@ -513,8 +515,8 @@ class TestInitCommand:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """鍵ファイル作成時にOSErrorが発生した場合でも、run()がクラッシュせず
-        終了コード1とわかりやすいエラーメッセージを返すことを確認する
-        （プラットフォームに依存しない決定的な検証）。
+        KeyStorageError（終了コード3）としてわかりやすいエラーメッセージを返す
+        ことを確認する（プラットフォームに依存しない決定的な検証）。
         """
 
         def _raise_os_error(*args: object, **kwargs: object) -> None:
@@ -527,9 +529,65 @@ class TestInitCommand:
 
         exit_code = handler.run(["init", "--key", str(key_path)])
 
+        assert exit_code == 3
+        assert stdout.getvalue() == ""
+        assert f"Failed to save the key file: {key_path}" in stderr.getvalue()
+        assert "simulated invalid path syntax" not in stderr.getvalue()
+        assert "Traceback" not in stderr.getvalue()
+
+    def test_permission_setup_failure_aborts_init_without_key_file(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        tmp_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """鍵ファイルの権限設定に失敗した場合、initが終了コード3で中断し、
+        鍵ファイル・一時ファイル・暗号化データを一切残さないことを確認する。
+        """
+
+        def _raise_os_error(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated permission failure")
+
+        monkeypatch.setattr(os, "chmod", _raise_os_error)
+        monkeypatch.setattr("subprocess.run", _raise_os_error)
+
+        key_dir = tmp_path / "vault"
+        key_path = key_dir / "master.key"
+        handler = handler_factory()
+
+        exit_code = handler.run(["init", "--key", str(key_path)])
+
+        assert exit_code == 3
+        assert stdout.getvalue() == ""
+        assert "Failed to restrict access to the key file" in stderr.getvalue()
+        assert "Traceback" not in stderr.getvalue()
+        assert list(key_dir.iterdir()) == []
+
+    def test_unexpected_os_error_outside_key_storage_falls_back_to_exit_code_1(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        tmp_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """鍵保存以外の処理で未変換のOSErrorが発生した場合、汎用のファイル操作
+        エラー（終了コード1）としてトレースバックなしで扱われることを確認する。
+        """
+
+        def _raise_os_error(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated storage failure")
+
+        monkeypatch.setattr(SecureStorage, "initialize", _raise_os_error)
+
+        handler = handler_factory()
+        exit_code = handler.run(["init", "--key", str(tmp_path / "master.key")])
+
         assert exit_code == 1
         assert stdout.getvalue() == ""
-        assert "Error" in stderr.getvalue()
+        assert "A file operation failed" in stderr.getvalue()
         assert "Traceback" not in stderr.getvalue()
 
 
@@ -1070,6 +1128,36 @@ class TestRekeyCommand:
         rotated = Path(f"{key_path}.1")
         assert rotated.is_file()
         assert rotated.read_bytes() == old_key_bytes
+
+    def test_rekey_permission_failure_keeps_old_key_and_data_usable(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """新鍵の権限設定に失敗した場合、rekeyが終了コード3で中断し、
+        旧鍵・暗号化データがそのまま利用可能であることを確認する（フェイルセーフ）。
+        """
+        _, key_path = initialized_handler
+        handler_factory().run(
+            ["add", "github", "--key", str(key_path), "--secret", "JBSWY3DPEHPK3PXP"]
+        )
+        old_key_bytes = key_path.read_bytes()
+
+        def _raise_os_error(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated permission failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "chmod", _raise_os_error)
+            patch.setattr("subprocess.run", _raise_os_error)
+            exit_code = handler_factory().run(["rekey", "--key", str(key_path)])
+
+        assert exit_code == 3
+        assert "Failed to restrict access to the key file" in stderr.getvalue()
+        assert key_path.read_bytes() == old_key_bytes
+        assert not Path(f"{key_path}.1").exists()
+        assert handler_factory().run(["list", "--key", str(key_path)]) == 0
 
     def test_rekey_prompts_rotation_limit_warning_when_three_generations_exist(
         self,

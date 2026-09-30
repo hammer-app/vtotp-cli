@@ -95,6 +95,17 @@ class InvalidKeyError(TotpCliError):
     exit_code: int = 3
 
 
+class KeyStorageError(TotpCliError):
+    """鍵ファイルの生成・保存またはアクセス権設定に失敗した場合に送出される例外。
+
+    一時ファイルの作成・書き込み・atomic置換、およびUnixパーミッション／
+    Windows ACLの設定失敗を表す。OSのエラー詳細やサブプロセス出力は
+    ``context`` に含めない（Zero Leakage Rule）。
+    """
+
+    exit_code: int = 3
+
+
 class StorageCorruptedError(TotpCliError):
     """暗号化データファイルが破損している、または復号に失敗した場合の例外。"""
 

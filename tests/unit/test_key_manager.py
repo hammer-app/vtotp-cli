@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import getpass
 import os
+import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
+from vtotp.core import key_manager as key_manager_module
 from vtotp.core.key_manager import KeyManager
-from vtotp.domain.exceptions import InvalidKeyError, KeyNotFoundError
+from vtotp.domain.exceptions import InvalidKeyError, KeyNotFoundError, KeyStorageError
+from vtotp.i18n.catalog import MsgKey
 
 #: chmodによる読み取り権限剥奪がOSレベルで機能しない環境（主にWindows）を判定する。
 IS_WINDOWS = sys.platform.startswith("win")
@@ -535,40 +541,575 @@ class TestRotateKeyFile:
         assert target.read_bytes() == history[-1]
 
 
-class TestAtomicWriteInternals:
-    """_atomic_write_bytes / _restrict_permissions の内部フォールバック挙動に関するテスト。"""
+class _RunRecorder:
+    """subprocess.run の代替。呼び出し引数を記録し、指定された例外を送出する。"""
 
-    def test_temp_file_is_removed_when_replace_fails(
-        self, key_manager: KeyManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+        self.error = error
+
+    def __call__(
+        self, args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        self.calls.append((list(args), kwargs))
+        if self.error is not None:
+            raise self.error
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+
+@pytest.fixture
+def force_unix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """実行OSに関わらず、Unix系の権限設定経路を通るようにする。"""
+    monkeypatch.setattr(key_manager_module, "_is_windows", lambda: False)
+
+
+@pytest.fixture
+def force_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """実行OSに関わらず、Windowsの権限設定経路を通るようにする。"""
+    monkeypatch.setattr(key_manager_module, "_is_windows", lambda: True)
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("USERNAME", "alice")
+    monkeypatch.setenv("USERDOMAIN", "WORKGROUP")
+
+
+@pytest.fixture
+def run_recorder(monkeypatch: pytest.MonkeyPatch) -> _RunRecorder:
+    """subprocess.run を成功を返す記録用スタブへ差し替える。"""
+    recorder = _RunRecorder()
+    monkeypatch.setattr(subprocess, "run", recorder)
+    return recorder
+
+
+def _expected_icacls() -> str:
+    """force_windows 環境下で期待される icacls.exe の絶対パスを返す。"""
+    return str(Path(r"C:\Windows") / "System32" / "icacls.exe")
+
+
+def _raise_os_error(*args: object, **kwargs: object) -> None:
+    """常に OSError を送出する差し替え用関数。"""
+    raise OSError("simulated failure")
+
+
+class TestIsWindows:
+    """_is_windows に関するテスト。"""
+
+    def test_reflects_os_name(self) -> None:
+        """os.name が "nt" の場合にのみ True を返すことを確認する。"""
+        assert key_manager_module._is_windows() is (os.name == "nt")
+
+
+class TestSetPrivatePermissionsUnix:
+    """set_private_permissions の Unix 系経路（chmod）に関するテスト。"""
+
+    def test_applies_owner_only_mode(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_unix: None,
     ) -> None:
-        """os.replaceが失敗した場合、一時ファイルが残らず例外がそのまま伝播することを確認する。"""
+        """os.chmod(path, 0o600) が呼ばれ、icacls は呼ばれないことを確認する。"""
+        target = tmp_path / "master.key"
+        calls: list[tuple[object, int]] = []
+        monkeypatch.setattr(os, "chmod", lambda path, mode: calls.append((path, mode)))
+        recorder = _RunRecorder()
+        monkeypatch.setattr(subprocess, "run", recorder)
+
+        key_manager.set_private_permissions(target)
+
+        assert calls == [(target, 0o600)]
+        assert recorder.calls == []
+
+    def test_chmod_failure_raises_key_storage_error(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_unix: None,
+    ) -> None:
+        """chmod の OSError が握りつぶされず KeyStorageError へ変換されることを確認する。"""
+        target = tmp_path / "master.key"
+        monkeypatch.setattr(os, "chmod", _raise_os_error)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.set_private_permissions(target)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert excinfo.value.context == {"path": str(target)}
+
+    @pytest.mark.skipif(
+        IS_WINDOWS, reason="Unixのモードビットは Windows では検証できない"
+    )
+    def test_created_key_file_is_owner_read_write_only(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """実環境で作成された鍵ファイルのモードが 0600 であることを確認する。"""
+        target = tmp_path / "master.key"
+        key_manager.create_key_file(target)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+class TestSetPrivatePermissionsWindows:
+    """set_private_permissions の Windows 経路（icacls）に関するテスト。"""
+
+    def test_invokes_icacls_with_argument_list(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """継承遮断と実行ユーザー専用の付与を、shell を使わず引数配列で渡すことを確認する。"""
         target = tmp_path / "master.key"
 
-        def _raise_os_error(*args: object, **kwargs: object) -> None:
-            raise OSError("simulated replace failure")
+        key_manager.set_private_permissions(target)
 
+        assert run_recorder.calls == [
+            (
+                [
+                    _expected_icacls(),
+                    str(target),
+                    "/inheritance:r",
+                    "/grant:r",
+                    "WORKGROUP\\alice:(R,W,D)",
+                ],
+                {"check": True, "capture_output": True},
+            )
+        ]
+
+    def test_does_not_call_chmod(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """Windows 経路では os.chmod を使わないことを確認する。"""
+        monkeypatch.setattr(os, "chmod", _raise_os_error)
+        key_manager.set_private_permissions(tmp_path / "master.key")
+        assert len(run_recorder.calls) == 1
+
+    def test_account_without_domain(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """USERDOMAIN が無い場合はユーザー名のみを付与対象にすることを確認する。"""
+        monkeypatch.delenv("USERDOMAIN")
+        key_manager.set_private_permissions(tmp_path / "master.key")
+        assert run_recorder.calls[0][0][-1] == "alice:(R,W,D)"
+
+    def test_falls_back_to_getpass_when_username_is_unset(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """環境変数 USERNAME が無い場合は getpass.getuser() の結果を使うことを確認する。"""
+        monkeypatch.delenv("USERNAME")
+        monkeypatch.setattr(getpass, "getuser", lambda: "bob")
+        key_manager.set_private_permissions(tmp_path / "master.key")
+        assert run_recorder.calls[0][0][-1] == "WORKGROUP\\bob:(R,W,D)"
+
+    def test_uses_default_system_root_when_unset(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """SystemRoot が無い場合も System32 配下の icacls.exe を絶対パスで指定することを確認する。"""
+        monkeypatch.delenv("SystemRoot")
+        key_manager.set_private_permissions(tmp_path / "master.key")
+        assert run_recorder.calls[0][0][0] == _expected_icacls()
+
+    @pytest.mark.parametrize(
+        "error",
+        [OSError("no user"), ImportError("No module named 'pwd'"), KeyError("uid")],
+    )
+    def test_user_lookup_failure_raises_key_storage_error(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+        error: BaseException,
+    ) -> None:
+        """実行ユーザー名を取得できない場合、icacls を呼ばずに KeyStorageError になることを確認する。"""
+        monkeypatch.delenv("USERNAME")
+
+        def _raise() -> str:
+            raise error
+
+        monkeypatch.setattr(getpass, "getuser", _raise)
+        target = tmp_path / "master.key"
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.set_private_permissions(target)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert excinfo.value.context == {"path": str(target)}
+        assert run_recorder.calls == []
+
+    def test_empty_user_name_raises_key_storage_error(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """ユーザー名が空文字列の場合も KeyStorageError になることを確認する。"""
+        monkeypatch.setenv("USERNAME", "")
+        monkeypatch.setattr(getpass, "getuser", lambda: "")
+        with pytest.raises(KeyStorageError):
+            key_manager.set_private_permissions(tmp_path / "master.key")
+        assert run_recorder.calls == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            subprocess.CalledProcessError(
+                5, ["icacls"], output=b"SENTINEL-OUT", stderr=b"SENTINEL-ERR"
+            ),
+            FileNotFoundError("icacls.exe not found"),
+            subprocess.TimeoutExpired(["icacls"], 1.0),
+        ],
+    )
+    def test_icacls_failure_raises_key_storage_error_without_output(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        error: BaseException,
+    ) -> None:
+        """icacls の失敗が KeyStorageError になり、コマンド出力を例外に残さないことを確認する。"""
+        monkeypatch.setattr(subprocess, "run", _RunRecorder(error))
+        target = tmp_path / "master.key"
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.set_private_permissions(target)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert excinfo.value.context == {"path": str(target)}
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
+        assert "SENTINEL" not in repr(excinfo.value)
+
+    def test_create_key_file_end_to_end_with_stubbed_icacls(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """Windows 経路でも一時ファイルへ ACL を設定してから配置されることを確認する。"""
+        target = tmp_path / "master.key"
+        key = b"\x11" * 32
+
+        key_manager.create_key_file(target, key=key)
+
+        assert target.read_bytes() == key
+        assert list(tmp_path.iterdir()) == [target]
+        acl_target = Path(run_recorder.calls[0][0][1])
+        assert acl_target.parent == tmp_path
+        assert acl_target.name.startswith(".master.key.")
+        assert acl_target.name.endswith(".tmp")
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の icacls による ACL 検証は Windows 専用"
+    )
+    def test_created_key_file_has_explicit_owner_only_acl(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """実環境で作成された鍵ファイルが継承 ACE を持たず、実行ユーザーのみに付与されていることを確認する。"""
+        target = tmp_path / "master.key"
+        key_manager.create_key_file(target)
+
+        result = subprocess.run(
+            [KeyManager._icacls_executable(), str(target)],
+            check=True,
+            capture_output=True,
+        )
+        output = result.stdout.decode(errors="replace")
+        account = KeyManager._current_windows_account(target)
+        ace_lines = [line for line in output.splitlines() if ":(" in line]
+        assert len(ace_lines) == 1, output
+        assert ace_lines[0].rstrip().endswith(f"{account}:(R,W,D)")
+        assert "(I)" not in output
+        assert len(key_manager.load_key(target)) == 32
+
+
+class TestSafeAtomicWrite:
+    """_store_key による安全な不可分書き込みとフェイルセーフに関するテスト。"""
+
+    def test_permissions_are_set_on_empty_temp_file_before_writing(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """権限設定が同一ディレクトリの空の一時ファイルに対し、鍵の書き込み前に行われることを確認する。"""
+        target = tmp_path / "master.key"
+        observed: list[tuple[Path, int]] = []
+
+        def _record(self: KeyManager, path: Path) -> None:
+            observed.append((path, path.stat().st_size))
+
+        monkeypatch.setattr(KeyManager, "set_private_permissions", _record)
+
+        key_manager.create_key_file(target, key=b"\x22" * 32)
+
+        assert len(observed) == 1
+        temp_path, size_at_call = observed[0]
+        assert size_at_call == 0
+        assert temp_path.parent == tmp_path
+        assert temp_path != target
+        assert not temp_path.exists()
+        assert target.read_bytes() == b"\x22" * 32
+
+    def test_permission_failure_aborts_and_cleans_up(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """権限設定失敗時は鍵を書き込まずに中断し、一時ファイルを残さないことを確認する。"""
+        target = tmp_path / "master.key"
+        original = b"\x01" * 32
+        target.write_bytes(original)
+
+        def _fail(self: KeyManager, path: Path) -> None:
+            raise KeyStorageError(
+                MsgKey.KEY_PERMISSION_SETUP_FAILED, context={"path": str(path)}
+            )
+
+        monkeypatch.setattr(KeyManager, "set_private_permissions", _fail)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.create_key_file(target, key=b"\x02" * 32)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert excinfo.value.context == {"path": str(target)}
+        assert target.read_bytes() == original
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_replace_failure_raises_key_storage_error_and_cleans_up(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """os.replace が失敗した場合、KeyStorageError となり一時ファイルが残らないことを確認する。"""
+        target = tmp_path / "master.key"
         monkeypatch.setattr(os, "replace", _raise_os_error)
 
-        with pytest.raises(OSError):
+        with pytest.raises(KeyStorageError) as excinfo:
             key_manager.create_key_file(target, key=b"\x00" * 32)
 
+        assert excinfo.value.message_key is MsgKey.KEY_STORAGE_FAILED
+        assert isinstance(excinfo.value.__cause__, OSError)
         assert not target.exists()
         assert list(tmp_path.iterdir()) == []
 
-    def test_permission_restriction_failure_is_silently_ignored(
-        self, key_manager: KeyManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_temp_file_creation_failure_raises_key_storage_error(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """os.chmodが失敗しても鍵ファイルの作成自体は成功することを確認する（Windows等での既定挙動）。"""
+        """一時ファイルの作成に失敗した場合 KeyStorageError になることを確認する。"""
+        monkeypatch.setattr(tempfile, "mkstemp", _raise_os_error)
+        with pytest.raises(KeyStorageError):
+            key_manager.create_key_file(tmp_path / "master.key")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_parent_directory_failure_raises_key_storage_error(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """親パスが通常ファイルでディレクトリを作成できない場合 KeyStorageError になることを確認する。"""
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_bytes(b"")
+        target = blocker / "master.key"
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.create_key_file(target)
+
+        assert excinfo.value.context == {"path": str(target)}
+
+    def test_short_write_is_detected_before_replace(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """書き込み後のサイズが32バイトでない場合、配置せずに KeyStorageError となることを確認する。"""
         target = tmp_path / "master.key"
+        original = b"\x01" * 32
+        target.write_bytes(original)
+        monkeypatch.setattr(os, "fsync", lambda fd: os.ftruncate(fd, 16))
 
-        def _raise_os_error(*args: object, **kwargs: object) -> None:
-            raise OSError("chmod not supported on this platform")
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.create_key_file(target, key=b"\x02" * 32)
 
+        assert excinfo.value.message_key is MsgKey.KEY_STORAGE_FAILED
+        assert target.read_bytes() == original
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_cleanup_failure_does_not_mask_original_error(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """一時ファイルの削除にも失敗した場合、元の失敗が KeyStorageError として優先されることを確認する。"""
+        monkeypatch.setattr(os, "replace", _raise_os_error)
+        monkeypatch.setattr(Path, "unlink", _raise_os_error)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.create_key_file(tmp_path / "master.key")
+
+        assert excinfo.value.message_key is MsgKey.KEY_STORAGE_FAILED
+
+    def test_error_does_not_leak_key_bytes(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """保存失敗時の例外に鍵のバイト列が含まれないことを確認する（Zero Leakage Rule）。"""
+        key = b"\xde\xad\xbe\xef" * 8
+        monkeypatch.setattr(os, "replace", _raise_os_error)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.create_key_file(tmp_path / "master.key", key=key)
+
+        rendered = repr(excinfo.value) + str(excinfo.value.__cause__)
+        assert key.hex() not in rendered
+        assert all(key.hex() not in value for value in excinfo.value.context.values())
+
+    def test_load_and_verify_do_not_enforce_permissions(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """読み取り経路では権限設定・検査を行わない（FAT32/exFAT 運用の維持）ことを確認する。"""
+        target = tmp_path / "master.key"
+        target.write_bytes(b"\x05" * 32)
+        monkeypatch.setattr(KeyManager, "set_private_permissions", _raise_os_error)
+        monkeypatch.setattr(subprocess, "run", _raise_os_error)
         monkeypatch.setattr(os, "chmod", _raise_os_error)
 
-        key = b"\x07" * 32
-        key_manager.create_key_file(target, key=key)
-        assert target.read_bytes() == key
+        key_manager.verify_key_file(target)
+        assert key_manager.load_key(target) == b"\x05" * 32
+
+
+class TestRotateKeyFileFailSafe:
+    """rotate_key_file のフェイルセーフ（失敗時に既存鍵を保全する）挙動に関するテスト。"""
+
+    @staticmethod
+    def _seed_generations(target: Path) -> dict[Path, bytes]:
+        """正式鍵と `.1`・`.2` を作成し、パスと内容の対応を返す。"""
+        contents = {
+            target: b"\x00" * 32,
+            Path(f"{target}.1"): b"\x01" * 32,
+            Path(f"{target}.2"): b"\x02" * 32,
+        }
+        for path, data in contents.items():
+            path.write_bytes(data)
+        return contents
+
+    def test_rejects_invalid_new_key_before_shifting(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """不正サイズの新鍵では世代繰り上げを一切行わずに InvalidKeyError となることを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_generations(target)
+
+        with pytest.raises(InvalidKeyError):
+            key_manager.rotate_key_file(target, b"short")
+
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert not Path(f"{target}.3").exists()
+
+    def test_permission_failure_leaves_generations_untouched(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """権限設定に失敗した場合、既存鍵と世代ファイルが変更されないことを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_generations(target)
+        monkeypatch.setattr(os, "chmod", _raise_os_error)
+        monkeypatch.setattr(subprocess, "run", _RunRecorder(OSError("denied")))
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert sorted(tmp_path.iterdir()) == sorted(contents)
+
+    def test_final_replace_failure_rolls_back_shifted_generations(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """新鍵の配置に失敗した場合、繰り上げ済みの世代が元に戻ることを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_generations(target)
+        real_replace = os.replace
+
+        def _fail_on_temp(source: Path, destination: Path) -> None:
+            if str(source).endswith(".tmp"):
+                raise OSError("simulated replace failure")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", _fail_on_temp)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert excinfo.value.message_key is MsgKey.KEY_STORAGE_FAILED
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert sorted(tmp_path.iterdir()) == sorted(contents)
+
+    def test_rollback_failure_still_reports_original_error(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ロールバック自体が失敗しても、元の配置失敗が KeyStorageError として送出されることを確認する。"""
+        target = tmp_path / "master.key"
+        self._seed_generations(target)
+        real_replace = os.replace
+        shifted: list[str] = []
+
+        def _fail_after_shift(source: Path, destination: Path) -> None:
+            if str(source).endswith(".tmp") or str(source) in shifted:
+                raise OSError("simulated replace failure")
+            real_replace(source, destination)
+            shifted.append(str(destination))
+
+        monkeypatch.setattr(os, "replace", _fail_after_shift)
+
+        with pytest.raises(KeyStorageError):
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert not list(tmp_path.glob("*.tmp"))
 
 
 def secrets_like_key() -> bytes:

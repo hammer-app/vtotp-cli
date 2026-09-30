@@ -318,16 +318,23 @@ class KeyManager:
 - **Unix系:** `os.chmod(path, 0o600)` を実行する。所有者以外の読み取り・書き込みを
     許可しない。
 - **Windows:** `subprocess.run` で標準コマンド `icacls` を呼び出し、継承を無効化して
-    現在のユーザーへ明示的な読み取り・書き込み権限だけを付与する。概念上の実行内容は
+    現在のユーザーへ明示的な読み取り・書き込み・削除権限だけを付与する。概念上の実行内容は
     次の通りであり、実装では `shell=True` を使わず引数配列として渡す。
 
     ```text
-    icacls <path> /inheritance:r /grant:r "%USERNAME%:(R,W)"
+    %SystemRoot%\System32\icacls.exe <path> /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:(R,W,D)"
     ```
 
-    `%USERNAME%` は実行時の現在ユーザー名に解決し、`subprocess.run(..., check=True,
-    capture_output=True)` で終了コードを検査する。標準出力・標準エラーには鍵の内容を
-    含めず、失敗時のコマンド出力もユーザー向け例外へそのまま流さない。
+    `%USERDOMAIN%\%USERNAME%` は実行時の現在ユーザー名に解決し（`USERNAME` が無い場合は
+    `getpass.getuser()`、`USERDOMAIN` が無い場合はユーザー名のみ）、`subprocess.run(...,
+    check=True, capture_output=True)` で終了コードを検査する。標準出力・標準エラーには
+    鍵の内容を含めず、失敗時のコマンド出力もユーザー向け例外へそのまま流さない。
+
+  - `D`（削除）を含めるのは、親フォルダの権限が「変更」のみ（子の削除権限なし）の
+    環境で、`(R,W)` だけでは `os.replace` による配置・世代繰り上げ・一時ファイル
+    削除が拒否されるためである。付与先は実行ユーザーのみであり、排他性は変わらない。
+  - `icacls` は `System32` の絶対パスで指定する。コマンド名だけを渡すと、Windowsの
+    プロセス生成はカレントディレクトリを `System32` より先に探索するためである。
 
 ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace のいずれかが失敗した
 場合は、既存の `pass` で握りつぶさない。`OSError`、`subprocess.CalledProcessError`
