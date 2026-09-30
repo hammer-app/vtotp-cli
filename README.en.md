@@ -118,8 +118,9 @@ Registers a Base32-encoded TOTP secret.
 
 For manual use, entering the secret via the interactive prompt (masked input) is recommended as it never touches your terminal history. For scripts and automated pipelines, secrets can be passed via standard input using the `--stdin` option.
 
+<!-- Note -->
 > **Note**: Specifying secrets via CLI arguments (`--secret` / `-s`) has been completely removed for security reasons, preventing plaintext secrets from leaking into shell history (`.bash_history`, PowerShell Readline history) or process lists (`ps`, `Get-Process`).
-
+<!-- Warning -->
 > **Warning (Shell history precaution)**: In an interactive terminal, piping secrets directly like `echo "SECRET" | vtotp add ... --stdin` will leave the plaintext secret in your shell's command history. When piping via stdin, use a temporary file (securely wiped after registration) or pipe from a password manager / secure secret store.
 
 ```powershell
