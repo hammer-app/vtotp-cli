@@ -1277,6 +1277,64 @@ class TestNonTtyInteractiveGuard:
         assert exit_code == 0
         assert "Enter the TOTP secret" in stderr.getvalue()
 
+    @staticmethod
+    def _prepare_broken_state(
+        scenario: str, tmp_path: Path, config_path: Path
+    ) -> list[str]:
+        """`scenario`に応じた鍵・ストレージの異常状態を用意し、`add`のargvを返す。"""
+        key_path = tmp_path / "master.key"
+        storage_path = config_path.parent / "vtotp-secrets.enc"
+        if scenario == "no_config":
+            # config.json・環境変数・`--key`のいずれにも鍵パスが無い状態。
+            return ["add", "github"]
+        if scenario == "missing_key":
+            return ["add", "github", "--key", str(tmp_path / "missing.key")]
+
+        KeyManager().create_key_file(key_path)
+        SecureStorage().initialize(storage_path, key_path.read_bytes())
+        if scenario == "missing_storage":
+            storage_path.unlink()
+        else:  # corrupted_storage
+            storage_path.write_text("{not valid json", encoding="utf-8")
+        return ["add", "github", "--key", str(key_path)]
+
+    @pytest.mark.parametrize(
+        "scenario",
+        ["no_config", "missing_key", "missing_storage", "corrupted_storage"],
+    )
+    def test_non_tty_guard_takes_precedence_over_key_and_storage_errors(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        tmp_path: Path,
+        config_path: Path,
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+        scenario: str,
+    ) -> None:
+        """鍵・ストレージが不在・破損していても、非TTYで`--stdin`を指定しない`add`は
+        鍵・ストレージへアクセスする前に、決定的に終了コード2
+        （`STDIN_OPTION_REQUIRED`）で終了することを確認する。
+        """
+        monkeypatch.delenv(ENV_KEY_PATH_VARIABLE, raising=False)
+        argv = self._prepare_broken_state(scenario, tmp_path, config_path)
+
+        # 対照：同じ状態で`--stdin`を指定すると、鍵・ストレージ由来の
+        # 終了コード（2以外のエラー）になることを確認しておく。
+        control_exit_code = handler_factory(stdin="JBSWY3DPEHPK3PXP\n").run(
+            [*argv, "--stdin"]
+        )
+        assert control_exit_code not in (0, 2)
+        stderr.truncate(0)
+        stderr.seek(0)
+
+        handler = handler_factory(["JBSWY3DPEHPK3PXP"], stdin="JBSWY3DPEHPK3PXP\n")
+        exit_code = handler.run(argv)
+
+        assert exit_code == 2
+        expected_message = EN_CATALOG[MsgKey.STDIN_OPTION_REQUIRED]
+        assert stderr.getvalue() == f"Error: {expected_message}\n"
+        assert "JBSWY3DPEHPK3PXP" not in stderr.getvalue()
+
 
 #: 廃止引数のテストで渡すシークレット値（stdout/stderrに現れてはならない）。
 _DEPRECATED_ARG_SECRET = "GEZDGNBVGY3TQOJQ"

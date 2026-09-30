@@ -397,6 +397,24 @@ class TestErrorHandlingExitCodes:
         assert result.returncode == 0, result.stderr
         assert "github" not in result.stdout
 
+    def test_add_without_stdin_option_on_pipe_returns_exit_code_2_before_key_access(
+        self, home_dir: Path, tmp_path: Path
+    ) -> None:
+        """鍵ファイルが存在しない（initなし）状態でも、パイプで`--stdin`を指定し忘れた
+        addは、鍵不在（終了コード3）ではなく決定的に終了コード2になることを確認する。
+        """
+        missing_key_path = tmp_path / "does-not-exist.key"
+
+        result = _run_cli(
+            ["add", "github", "--key", str(missing_key_path)],
+            home_dir,
+            stdin_text=f"{_GITHUB_SECRET}\n",
+        )
+        assert result.returncode == 2
+        assert "Standard input is not a terminal" in result.stderr
+        assert "Key file not found" not in result.stderr
+        assert _GITHUB_SECRET not in result.stdout + result.stderr
+
     @pytest.mark.parametrize(
         "secret_args",
         [

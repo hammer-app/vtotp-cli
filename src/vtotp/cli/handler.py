@@ -766,6 +766,13 @@ class CliHandler:
 
     def _cmd_add(self, args: argparse.Namespace) -> int:
         """新しいサービスをシークレットとともに登録する。"""
+        # 非TTY（パイプ・リダイレクト・CI等）では、WindowsのgetpassがOSの
+        # コンソールを直接読みに行きパイプを無視して無期限に待機するため、
+        # `--stdin` の指定漏れとして即座に拒否する。鍵・ストレージの状態に
+        # 左右されず決定的に終了コード2となるよう、ファイルアクセスより前に行う。
+        if not args.stdin and not self._stdin_is_terminal():
+            raise CommandParseError(MsgKey.STDIN_OPTION_REQUIRED, context={})
+
         key_path = self._resolve_key_path(args.key)
         storage_path = self._resolve_storage_path(args.storage)
 
@@ -776,11 +783,6 @@ class CliHandler:
         if args.stdin:
             secret = self._read_secret_from_stdin()
         else:
-            # 非TTY（パイプ・リダイレクト・CI等）では、WindowsのgetpassがOSの
-            # コンソールを直接読みに行きパイプを無視して無期限に待機するため、
-            # 対話プロンプトへ入る前に `--stdin` の指定漏れとして即座に拒否する。
-            if not self._stdin_is_terminal():
-                raise CommandParseError(MsgKey.STDIN_OPTION_REQUIRED, context={})
             secret = self._prompt_for_secret()
             if secret is None:
                 self._cancel()
