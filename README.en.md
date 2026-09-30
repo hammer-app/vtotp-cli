@@ -1,10 +1,10 @@
-English | [日本語](README.md)
-
 # vtotp
+
+English | [日本語](README.md)
 
 A high-security CLI TOTP (Time-based One-Time Password) authenticator built with practicality and robustness on Windows in mind.
 
-It physically separates the master key from encrypted data, guarantees that secrets never appear in memory dumps or logs (Zero Leakage Rule), and fully handles Windows-specific path-input quirks.
+It physically separates the master key from encrypted data, ensures plaintext secrets are never persisted to disk and never leak into display outputs or logs (Zero Leakage Rule), and fully handles Windows-specific path-input quirks.
 
 ---
 
