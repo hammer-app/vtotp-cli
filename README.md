@@ -118,14 +118,19 @@ Base32 形式の TOTP シークレットを登録します。
 
 > **Note**: コマンドライン引数（`--secret` / `-s`）による直接指定は、シェル履歴（`.bash_history`、PowerShell Readline 履歴）やプロセスコマンドライン（`ps`, `Get-Process`）に平文シークレットが残存する重大なリスクがあるため、セキュリティ上の理由から完全に廃止されました。
 
+> **Warning (シェル履歴への配慮)**: 対話ターミナルで `echo "シークレット" | vtotp add ... --stdin` のように直接シークレット文字列をパイプすると、シェルのコマンド履歴に平文が残ってしまいます。標準入力連携を利用する際は、シークレットを記載した一時ファイル（登録後速やかに破棄）やパスワードマネージャー／環境変数等からのパイプを使用してください。
+
 ```powershell
 # 対話入力で安全に登録（推奨: マスキング入力のためターミナル履歴に残りません）
 vtotp add github
 vtotp add aws --issuer Amazon
 
-# 標準入力パイプ渡しによる登録（スクリプト・自動化向け: --stdin を指定）
-echo "JBSWY3DPEHPK3PXP" | vtotp add aws --stdin
-echo "JBSWY3DPEHPK3PXP" | vtotp add aws --issuer Amazon --stdin
+# 標準入力パイプ渡しによる登録（PowerShell: 一時ファイル等からパイプ渡し）
+Get-Content secret.txt | vtotp add aws --stdin
+Get-Content secret.txt | vtotp add aws --issuer Amazon --stdin
+
+# （参考）Linux / macOS でのファイルパイプ渡し
+# cat secret.txt | vtotp add aws --stdin
 ```
 
 ### 3. TOTP コードの生成 (`generate`、エイリアス: `get` / `-g`、省略形)

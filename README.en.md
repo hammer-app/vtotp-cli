@@ -120,14 +120,19 @@ For manual use, entering the secret via the interactive prompt (masked input) is
 
 > **Note**: Specifying secrets via CLI arguments (`--secret` / `-s`) has been completely removed for security reasons, preventing plaintext secrets from leaking into shell history (`.bash_history`, PowerShell Readline history) or process lists (`ps`, `Get-Process`).
 
+> **Warning (Shell history precaution)**: In an interactive terminal, piping secrets directly like `echo "SECRET" | vtotp add ... --stdin` will leave the plaintext secret in your shell's command history. When piping via stdin, use a temporary file (securely wiped after registration) or pipe from a password manager / secure secret store.
+
 ```powershell
 # Enter interactively (recommended: masked input, never touches shell history)
 vtotp add github
 vtotp add aws --issuer Amazon
 
-# Pass via standard input pipe (for scripts/automation: requires --stdin)
-echo "JBSWY3DPEHPK3PXP" | vtotp add aws --stdin
-echo "JBSWY3DPEHPK3PXP" | vtotp add aws --issuer Amazon --stdin
+# Pass via standard input pipe (PowerShell: piping from a file or secret store)
+Get-Content secret.txt | vtotp add aws --stdin
+Get-Content secret.txt | vtotp add aws --issuer Amazon --stdin
+
+# (Reference) Linux / macOS file pipe example:
+# cat secret.txt | vtotp add aws --stdin
 ```
 
 ### 3. Generate a TOTP code (`generate`, aliases: `get` / `-g`, or the shorthand form)
