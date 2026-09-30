@@ -349,6 +349,54 @@ class TestErrorHandlingExitCodes:
         assert result.returncode == 0, result.stderr
         assert "github" not in result.stdout
 
+    @pytest.mark.parametrize("bom_prefix", ["﻿", "﻿﻿"])
+    def test_add_with_bom_prefixed_stdin_registers_service(
+        self, home_dir: Path, tmp_path: Path, bom_prefix: str
+    ) -> None:
+        """Windows PowerShell 5.1（コードページ65001）のように先頭へ単一・複数の
+        UTF-8 BOMが付与された標準入力でも、実プロセス実行で正しく登録され、
+        TOTPコードを生成できることを確認する。
+        """
+        key_path = tmp_path / "master.key"
+        assert _run_cli(["init", "--key", str(key_path)], home_dir).returncode == 0
+
+        result = _run_cli(
+            ["add", "github", "--key", str(key_path), "--stdin"],
+            home_dir,
+            stdin_text=f"{bom_prefix}{_GITHUB_SECRET}\r\n",
+        )
+        assert result.returncode == 0, result.stderr
+
+        result = _run_cli(["generate", "github", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().isdigit()
+
+    @pytest.mark.parametrize("stdin_text", [f"{_GITHUB_SECRET}\n", ""])
+    def test_add_without_stdin_option_on_pipe_fails_fast_with_exit_code_2(
+        self, home_dir: Path, tmp_path: Path, stdin_text: str
+    ) -> None:
+        """パイプ（非TTY）で`--stdin`を指定せずにaddした場合、キーボード入力を待って
+        ハングせずに終了コード2で`--stdin`の指定を促し、シークレットをエコーバック
+        せず、サービスも登録しないことを確認する。
+        """
+        key_path = tmp_path / "master.key"
+        assert _run_cli(["init", "--key", str(key_path)], home_dir).returncode == 0
+
+        result = _run_cli(
+            ["add", "github", "--key", str(key_path)],
+            home_dir,
+            stdin_text=stdin_text,
+        )
+        assert result.returncode == 2
+        assert "Standard input is not a terminal" in result.stderr
+        assert "Enter the TOTP secret" not in result.stderr
+        assert _GITHUB_SECRET not in result.stdout + result.stderr
+        assert "Traceback" not in result.stderr
+
+        result = _run_cli(["list", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        assert "github" not in result.stdout
+
     @pytest.mark.parametrize(
         "secret_args",
         [

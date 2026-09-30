@@ -56,6 +56,9 @@ _QUOTE_CHARS = "\"'"
 #: `add --stdin` で読み込んだシークレットの末尾から除去する改行文字。
 _TRAILING_NEWLINE_CHARS = "\r\n"
 
+#: `add --stdin` で読み込んだシークレットの先頭から除去するBOM（U+FEFF）。
+_BOM_CHAR = "﻿"
+
 #: 廃止済みのシークレット引数（長形式・短形式）。
 _DEPRECATED_SECRET_LONG_OPTION = "--secret"
 _DEPRECATED_SECRET_SHORT_OPTION = "-s"
@@ -635,20 +638,46 @@ class CliHandler:
         response = response.strip()
         return response if response else None
 
+    def _stdin_is_terminal(self) -> bool:
+        """標準入力が対話端末（TTY）かを判定する。
+
+        `isatty` を持たないストリーム（標準入力が存在しない実行環境等）は、
+        キーボード入力を待てないため非TTYとして扱う。
+        """
+        isatty = getattr(self._stdin, "isatty", None)
+        return callable(isatty) and bool(isatty())
+
+    def _read_stdin_text(self) -> str:
+        """標準入力全体を文字列として読み込む。
+
+        バイナリバッファを持つ実際の標準入力は、ロケール既定のエンコーディング
+        （日本語Windowsではcp932）ではなくUTF-8としてデコードする。これにより
+        Windows PowerShell 5.1がコードページ65001下でパイプ先へ付与するUTF-8 BOM
+        （`EF BB BF`）が `\\ufeff` として復元され、呼び出し元で除去できる。
+        Base32シークレットはASCIIのみで構成されるため、UTF-8でのデコードは
+        いずれのコードページから渡された正規の入力も変化させない。
+        """
+        buffer = getattr(self._stdin, "buffer", None)
+        if buffer is None:
+            return self._stdin.read()
+        data: bytes = buffer.read()
+        return data.decode("utf-8")
+
     def _read_secret_from_stdin(self) -> str:
         """`add --stdin` 指定時に、標準入力全体からTOTPシークレットを読み込む。
 
-        末尾の改行（CR/LF）のみを除去して返す。パイプ連携向けの経路で
-        あるため、空入力は対話入力のようなキャンセルではなく、不正な
-        シークレットとして :class:`InvalidSecretError` を送出する。デコード
-        できないバイト列が渡された場合も同様に扱い、入力内容は例外へ
+        先頭のUTF-8 BOM（Windows PowerShell 5.1が多重に付与する場合を含む）を
+        すべて除去したうえで、末尾の改行（CR/LF）を除去して返す。パイプ連携
+        向けの経路であるため、空入力は対話入力のようなキャンセルではなく、
+        不正なシークレットとして :class:`InvalidSecretError` を送出する。
+        デコードできないバイト列が渡された場合も同様に扱い、入力内容は例外へ
         含めない（Zero Leakage Rule）。
         """
         try:
-            raw = self._stdin.read()
+            raw = self._read_stdin_text()
         except UnicodeDecodeError:
             raise InvalidSecretError(MsgKey.SECRET_INVALID_FORMAT) from None
-        secret = raw.rstrip(_TRAILING_NEWLINE_CHARS)
+        secret = raw.lstrip(_BOM_CHAR).rstrip(_TRAILING_NEWLINE_CHARS)
         if not secret:
             raise InvalidSecretError(MsgKey.SECRET_EMPTY)
         return secret
@@ -747,6 +776,11 @@ class CliHandler:
         if args.stdin:
             secret = self._read_secret_from_stdin()
         else:
+            # 非TTY（パイプ・リダイレクト・CI等）では、WindowsのgetpassがOSの
+            # コンソールを直接読みに行きパイプを無視して無期限に待機するため、
+            # 対話プロンプトへ入る前に `--stdin` の指定漏れとして即座に拒否する。
+            if not self._stdin_is_terminal():
+                raise CommandParseError(MsgKey.STDIN_OPTION_REQUIRED, context={})
             secret = self._prompt_for_secret()
             if secret is None:
                 self._cancel()

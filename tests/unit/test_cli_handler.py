@@ -35,6 +35,13 @@ def _make_input(responses: list[str]) -> Callable[[], str]:
     return _input
 
 
+class _TtyStringIO(io.StringIO):
+    """対話端末（TTY）に接続された標準入力を模したストリーム。"""
+
+    def isatty(self) -> bool:
+        return True
+
+
 @pytest.fixture
 def stdout() -> io.StringIO:
     """テスト対象へ注入する標準出力用ストリームを返す。"""
@@ -59,17 +66,24 @@ def handler_factory(
 ) -> Callable[..., CliHandler]:
     """注入済みストリーム・一時config.jsonを持つCliHandlerを生成するファクトリを返す。"""
 
-    def _factory(responses: list[str] | None = None, stdin: str = "") -> CliHandler:
+    def _factory(
+        responses: list[str] | None = None, stdin: str | None = None
+    ) -> CliHandler:
         # 通常の対話入力とシークレットのマスキング入力は、同じ応答列を
         # 呼び出し順に消費する（実運用の入力順序をそのまま再現する）。
         input_func = _make_input(responses or [])
+        # `stdin`未指定は対話端末からの実行、指定ありはパイプ・リダイレクト
+        # （非TTY）からの実行を模す。
+        stdin_stream: io.StringIO = (
+            _TtyStringIO() if stdin is None else io.StringIO(stdin)
+        )
         return CliHandler(
             stdout=stdout,
             stderr=stderr,
             config_path=config_path,
             input_func=input_func,
             secret_input_func=input_func,
-            stdin=io.StringIO(stdin),
+            stdin=stdin_stream,
         )
 
     return _factory
@@ -953,6 +967,8 @@ class TestAddCommand:
             return "JBSWY3DPEHPK3PXP"
 
         monkeypatch.setattr(getpass, "getpass", _fake_getpass)
+        # pytest実行中のsys.stdinは非TTYのため、対話端末からの実行を模す。
+        monkeypatch.setattr(sys, "stdin", _TtyStringIO())
         handler = CliHandler(stdout=stdout, stderr=stderr, config_path=config_path)
         exit_code = handler.run(["add", "github", "--key", str(key_path)])
         assert exit_code == 0
@@ -979,6 +995,85 @@ class TestAddCommand:
 
         records = self._load_records(config_path, key_path)
         assert records["github"].secret == "JBSWY3DPEHPK3PXP"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "﻿JBSWY3DPEHPK3PXP\n",
+            "﻿﻿JBSWY3DPEHPK3PXP\r\n",
+            "﻿﻿﻿JBSWY3DPEHPK3PXP",
+        ],
+    )
+    def test_add_with_stdin_strips_leading_boms(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        payload: str,
+    ) -> None:
+        """`--stdin`の入力先頭に付与された単一・複数のBOM（U+FEFF）がすべて除去され、
+        シークレットが正しく登録されることを確認する。
+        """
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin=payload)
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 0
+
+        records = self._load_records(config_path, key_path)
+        assert records["github"].secret == "JBSWY3DPEHPK3PXP"
+
+    @pytest.mark.parametrize("bom_count", [0, 1, 2])
+    def test_add_with_stdin_bytes_decodes_utf8_regardless_of_locale_encoding(
+        self,
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        bom_count: int,
+    ) -> None:
+        """Windows PowerShell 5.1（コードページ65001）が送るBOM付きバイト列を、
+        標準入力のテキストエンコーディングがcp932（日本語Windowsの既定）であっても
+        UTF-8として解釈してBOMを除去し、正しく登録できることを確認する。
+        """
+        _, key_path = initialized_handler
+        raw = b"\xef\xbb\xbf" * bom_count + b"JBSWY3DPEHPK3PXP\r\n"
+        handler = CliHandler(
+            stdout=stdout,
+            stderr=stderr,
+            config_path=config_path,
+            stdin=io.TextIOWrapper(io.BytesIO(raw), encoding="cp932"),
+        )
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 0, stderr.getvalue()
+
+        records = self._load_records(config_path, key_path)
+        assert records["github"].secret == "JBSWY3DPEHPK3PXP"
+
+    @pytest.mark.parametrize("payload", ["﻿", "﻿﻿\r\n"])
+    def test_add_with_bom_only_stdin_returns_exit_code_6(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        stderr: io.StringIO,
+        payload: str,
+    ) -> None:
+        """BOMと改行のみの`--stdin`入力は、空のシークレットとして終了コード6になることを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin=payload)
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 6
+        assert "TOTP secret is empty" in stderr.getvalue()
+
+    def test_add_with_stdin_does_not_strip_non_leading_bom(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+    ) -> None:
+        """先頭以外に含まれるU+FEFFは除去されず、不正な形式（終了コード6）になることを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin="JBSWY3DP﻿EHPK3PXP\n")
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "--stdin"])
+        assert exit_code == 6
 
     def test_add_cancelled_when_secret_prompt_is_empty(
         self,
@@ -1093,6 +1188,94 @@ class TestAddCommand:
 
         combined = stdout.getvalue() + stderr.getvalue()
         assert invalid_secret not in combined
+
+
+class _NoIsattyStream:
+    """`isatty`を持たない標準入力（標準入力が存在しない実行環境等）を模したストリーム。"""
+
+    def read(self) -> str:
+        return ""
+
+
+class TestNonTtyInteractiveGuard:
+    """非TTYで`--stdin`を指定せずに`add`した場合のハング防止に関するテスト。"""
+
+    @pytest.mark.parametrize("piped_text", ["JBSWY3DPEHPK3PXP\n", ""])
+    def test_add_without_stdin_option_on_non_tty_returns_exit_code_2(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        piped_text: str,
+    ) -> None:
+        """パイプ・リダイレクト（非TTY）で`--stdin`を指定しない場合、対話入力を待たずに
+        終了コード2で`STDIN_OPTION_REQUIRED`を出力し、何も登録しないことを確認する。
+        """
+        _, key_path = initialized_handler
+        # 対話入力関数が呼ばれた場合に備えて応答を用意し、それでも登録されない
+        # （＝プロンプトへ進んでいない）ことを検証する。
+        handler = handler_factory(["JBSWY3DPEHPK3PXP"], stdin=piped_text)
+        exit_code = handler.run(["add", "github", "--key", str(key_path)])
+
+        assert exit_code == 2
+        expected_message = EN_CATALOG[MsgKey.STDIN_OPTION_REQUIRED]
+        assert stderr.getvalue() == f"Error: {expected_message}\n"
+        assert "Enter the TOTP secret" not in stderr.getvalue()
+        assert "JBSWY3DPEHPK3PXP" not in stdout.getvalue() + stderr.getvalue()
+        records = SecureStorage().load_secrets(
+            config_path.parent / "vtotp-secrets.enc", key_path.read_bytes()
+        )
+        assert records == {}
+
+    def test_stream_without_isatty_is_treated_as_non_tty(
+        self,
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+    ) -> None:
+        """`isatty`を持たない標準入力は非TTYとして扱われ、終了コード2になることを確認する。"""
+        _, key_path = initialized_handler
+        handler = CliHandler(
+            stdout=stdout,
+            stderr=stderr,
+            config_path=config_path,
+            stdin=_NoIsattyStream(),  # type: ignore[arg-type]
+            secret_input_func=_make_input(["JBSWY3DPEHPK3PXP"]),
+        )
+        exit_code = handler.run(["add", "github", "--key", str(key_path)])
+        assert exit_code == 2
+        assert EN_CATALOG[MsgKey.STDIN_OPTION_REQUIRED] in stderr.getvalue()
+
+    def test_non_tty_message_is_localized_to_japanese(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        stderr: io.StringIO,
+    ) -> None:
+        """`-l ja`指定時、非TTY拒否メッセージが日本語で表示されることを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(stdin="JBSWY3DPEHPK3PXP\n")
+        exit_code = handler.run(["add", "github", "--key", str(key_path), "-l", "ja"])
+        assert exit_code == 2
+        assert stderr.getvalue() == (
+            f"エラー: {JA_CATALOG[MsgKey.STDIN_OPTION_REQUIRED]}\n"
+        )
+
+    def test_tty_stdin_still_uses_interactive_prompt(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        stderr: io.StringIO,
+    ) -> None:
+        """TTYの場合は従来どおり対話プロンプトへ進むことを確認する（対照テスト）。"""
+        _, key_path = initialized_handler
+        handler = handler_factory(["JBSWY3DPEHPK3PXP"])
+        exit_code = handler.run(["add", "github", "--key", str(key_path)])
+        assert exit_code == 0
+        assert "Enter the TOTP secret" in stderr.getvalue()
 
 
 #: 廃止引数のテストで渡すシークレット値（stdout/stderrに現れてはならない）。
