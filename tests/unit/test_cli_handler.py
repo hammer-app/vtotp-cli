@@ -1227,8 +1227,51 @@ class TestDeprecatedSecretArgRejection:
     @pytest.mark.parametrize(
         "argv",
         [
-            [],
+            # サブコマンドより前に置かれた場合（Copilotレビュー指摘 [P1]）。
+            ["--secret", _DEPRECATED_ARG_SECRET, "add", "github"],
+            ["-s", _DEPRECATED_ARG_SECRET, "add", "github"],
+            [f"--secret={_DEPRECATED_ARG_SECRET}", "add", "github"],
+            [f"-s{_DEPRECATED_ARG_SECRET}", "add", "github"],
+            ["--secret", _DEPRECATED_ARG_SECRET],
+            # `add`以外のコマンド・省略形フォールバック・エイリアス。
+            ["--secret", _DEPRECATED_ARG_SECRET, "list"],
+            ["github", "--secret", _DEPRECATED_ARG_SECRET],
             ["generate", "github", "-s", _DEPRECATED_ARG_SECRET],
+            ["-g", "github", f"-s{_DEPRECATED_ARG_SECRET}"],
+            ["rekey", f"--secret={_DEPRECATED_ARG_SECRET}"],
+        ],
+    )
+    def test_deprecated_secret_arg_is_rejected_regardless_of_position(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        argv: list[str],
+    ) -> None:
+        """サブコマンドより前や`add`以外のコマンドに置かれた`--secret`/`-s`も、argparseへ
+        渡る前に終了コード2で拒否され、固定の廃止メッセージだけが出力されて
+        シークレット値がエコーバックされないことを確認する。
+        """
+        handler = handler_factory()
+        exit_code = handler.run(argv)
+
+        assert exit_code == 2
+        expected_message = EN_CATALOG[MsgKey.SECRET_ARG_DEPRECATED]
+        assert stderr.getvalue() == f"Error: {expected_message}\n"
+        assert _DEPRECATED_ARG_SECRET not in stderr.getvalue()
+        assert _DEPRECATED_ARG_SECRET not in stdout.getvalue()
+        assert "unrecognized arguments" not in stderr.getvalue()
+        assert "usage:" not in stderr.getvalue()
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            [],
+            ["generate", "github", "--storage", "PATH", "-l", "ja"],
+            ["list", "-k", "PATH"],
+            ["remove", "github", "--force"],
+            ["config", "set", "language", "ja"],
+            ["init", "--key=-secret.key"],
             ["add", "github"],
             ["add", "github", "--stdin", "--storage", "PATH", "--issuer", "X"],
             ["add", "github", "--st", "-k", "PATH", "-l", "ja", "-h"],
@@ -1239,8 +1282,9 @@ class TestDeprecatedSecretArgRejection:
     def test_non_deprecated_arguments_pass_through(
         self, handler_factory: Callable[..., CliHandler], argv: list[str]
     ) -> None:
-        """`add`以外のコマンドや、現行オプション（`--stdin`/`--storage`等・`--s`/`--st`の
-        曖昧な省略形）は事前検査で誤検知されず、後続の解析へ委ねられることを確認する。
+        """各コマンドの現行オプション（`--stdin`/`--storage`等・`--s`/`--st`の曖昧な
+        省略形・`=`結合形式の値）は事前検査で誤検知されず、後続の解析へ委ねられる
+        ことを確認する。
         """
         handler = handler_factory()
         handler.reject_deprecated_secret_args(argv)

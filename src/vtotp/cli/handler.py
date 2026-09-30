@@ -322,20 +322,23 @@ class CliHandler:
         return ["generate", first, *argv[1:]]
 
     def reject_deprecated_secret_args(self, argv: Sequence[str]) -> None:
-        """`add` の引数に廃止済みの `--secret`/`-s` が含まれていれば拒否する。
+        """引数列のどこかに廃止済みの `--secret`/`-s` が含まれていれば拒否する。
 
         argparseへ渡すと、未知の引数として `unrecognized arguments: --secret
         VALUE` のようにシークレット値をstderrへエコーバックしてしまうため、
         解析より前に検知し、固定メッセージの :class:`CommandParseError`
         （終了コード2）へ変換する。引数列や値は例外コンテキストへ一切含め
-        ない（DESIGN.md 20.3、Zero Leakage Rule）。`--` 以降のトークンも
-        argparseは未知の引数としてエコーバックするため、同様に検査対象とする。
-        SERVICEより前に置かれた場合も、位置検証より優先してこのメッセージで
-        拒否する。
+        ない（DESIGN.md 20.3、Zero Leakage Rule）。
+
+        サブコマンドより前（`vtotp --secret VALUE add github`）、`add`以外の
+        コマンドや省略形（`vtotp github --secret VALUE`）、`--` 以降も
+        argparseは同様にエコーバックするため、位置・コマンドを問わず全トークンを
+        検査対象とする。SERVICEの位置検証より優先してこのメッセージで拒否する。
+        いずれのサブコマンドにも `-s` で始まる短形式オプションや `--se` で
+        始まる長形式オプションは存在せず、`-` で始まる値はargparse自体が
+        オプションとみなして値として受理しないため、正規の引数を誤検知しない。
         """
-        if not argv or argv[0] != "add":
-            return
-        if any(_is_deprecated_secret_arg(token) for token in argv[1:]):
+        if any(_is_deprecated_secret_arg(token) for token in argv):
             raise CommandParseError(MsgKey.SECRET_ARG_DEPRECATED, context={})
 
     def _validate_service_position(self, argv: Sequence[str]) -> None:

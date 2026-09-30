@@ -383,6 +383,41 @@ class TestErrorHandlingExitCodes:
         assert result.returncode == 0, result.stderr
         assert "github" not in result.stdout
 
+    @pytest.mark.parametrize(
+        "secret_args",
+        [
+            ["--secret", _GITHUB_SECRET],
+            ["-s", _GITHUB_SECRET],
+            [f"--secret={_GITHUB_SECRET}"],
+            [f"-s{_GITHUB_SECRET}"],
+        ],
+    )
+    def test_secret_option_before_subcommand_returns_exit_code_2_without_echo(
+        self, home_dir: Path, tmp_path: Path, secret_args: list[str]
+    ) -> None:
+        """サブコマンドより前に置かれた`--secret`/`-s`（`vtotp --secret VALUE add github`）も、
+        実プロセス実行で終了コード2として拒否され、固定の廃止メッセージだけが出力されて
+        シークレット値がエコーバックされないことを確認する。
+        """
+        key_path = tmp_path / "master.key"
+        assert _run_cli(["init", "--key", str(key_path)], home_dir).returncode == 0
+
+        result = _run_cli(
+            [*secret_args, "add", "github", "--key", str(key_path)],
+            home_dir,
+        )
+        assert result.returncode == 2
+        assert "The --secret/-s option has been removed for security" in result.stderr
+        assert _GITHUB_SECRET not in result.stderr
+        assert _GITHUB_SECRET not in result.stdout
+        assert "unrecognized arguments" not in result.stderr
+        assert "usage:" not in result.stderr
+        assert "Traceback" not in result.stderr
+
+        result = _run_cli(["list", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        assert "github" not in result.stdout
+
     def test_corrupted_storage_returns_exit_code_4(
         self, home_dir: Path, tmp_path: Path
     ) -> None:
