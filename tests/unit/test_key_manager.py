@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import getpass
 import os
 import re
@@ -586,6 +587,35 @@ def _expected_icacls() -> str:
     return str(Path(r"C:\Windows") / "System32" / "icacls.exe")
 
 
+def _normalize_sddl_sid(sid: str) -> str:
+    """SDDL の SID 表記（"LA" 等の別名を含む）を完全な SID 文字列へ変換する（Windows 専用）。"""
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    binary_sid = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(binary_sid)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        string_sid = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(binary_sid, ctypes.byref(string_sid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return ctypes.wstring_at(string_sid.value)
+        finally:
+            kernel32.LocalFree(string_sid)
+    finally:
+        kernel32.LocalFree(binary_sid)
+
+
 def _raise_os_error(*args: object, **kwargs: object) -> None:
     """常に OSError を送出する差し替え用関数。"""
     raise OSError("simulated failure")
@@ -873,7 +903,14 @@ class TestSetPrivatePermissionsWindows:
         assert sddl.startswith("D:P"), sddl
         aces = [ace.split(";") for ace in re.findall(r"\(([^)]*)\)", sddl)]
         assert all("ID" not in ace[1] for ace in aces), sddl
-        user_aces = [ace for ace in aces if ace[5] not in {"SY", "BA"}]
+        # SDDL は既知の SID を別名（SY, BA, 組み込み Administrator の LA 等）で
+        # 表記するため、完全な SID 文字列へ正規化してから比較する。
+        privileged_sids = {"S-1-5-18", "S-1-5-32-544"}  # SYSTEM, Administrators
+        user_aces = [
+            [*ace[:5], _normalize_sddl_sid(ace[5])]
+            for ace in aces
+            if _normalize_sddl_sid(ace[5]) not in privileged_sids
+        ]
         # 0x13019f = 読み取り(0x120089) | 書き込み(0x100116) | 削除(0x10000)
         assert user_aces == [["A", "", "0x13019f", "", "", user_sid]], sddl
         assert len(key_manager.load_key(target)) == 32
