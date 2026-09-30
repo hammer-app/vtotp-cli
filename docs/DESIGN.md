@@ -634,6 +634,10 @@ class CliHandler:
         """正規化後の引数を解析する"""
         ...
 
+    def reject_deprecated_secret_args(self, argv: list[str]) -> None:
+        """addの廃止済みシークレット引数を安全に検知する"""
+        ...
+
     def dispatch(self, command: ParsedCommand) -> int:
         """解析済みコマンドをユースケースへ委譲する"""
         ...
@@ -642,6 +646,12 @@ class CliHandler:
         """安全なエラー表示と終了コード変換"""
         ...
 ```
+
+`run()` は引数を正規化した後、`add` の引数を `argparse` に渡す前に
+`reject_deprecated_secret_args()` で事前検査する。`--secret` / `-s` が指定されていたら、
+引数列や該当値を表示・ログ出力・例外コンテキストへ複製せず、固定の
+`SECRET_ARG_DEPRECATED` を持つ `CommandParseError` に変換する。これにより、
+`argparse` 標準の `unrecognized arguments: ...` が秘密値をエコーバックする経路を遮断する。
 
 ## 12. CLIコマンド定義
 
@@ -1242,13 +1252,20 @@ class MsgKey(StrEnum):
     SERVICE_NOT_FOUND = "service_not_found"
     INVALID_SECRET = "invalid_secret"
     COMMAND_PARSE_ERROR = "command_parse_error"
+    SECRET_ARG_DEPRECATED = "secret_arg_deprecated"
     CONFIG_SUMMARY = "config_summary"
     CONFIG_LANGUAGE_UPDATED = "config_language_updated"
 
 
 Catalog = Mapping[MsgKey, str]
-EN_CATALOG: Catalog = {...}
-JA_CATALOG: Catalog = {...}
+EN_CATALOG: Catalog = {
+    # 他のメッセージキーは省略
+    MsgKey.SECRET_ARG_DEPRECATED: "The --secret/-s option has been removed for security. Use interactive prompt or --stdin.",
+}
+JA_CATALOG: Catalog = {
+    # 他のメッセージキーは省略
+    MsgKey.SECRET_ARG_DEPRECATED: "--secret/-s オプションはセキュリティのため廃止されました。対話入力または --stdin を使用してください。",
+}
 SUPPORTED_LANGUAGES = ("en", "ja")
 ```
 
@@ -1324,6 +1341,15 @@ vtotp config set language en|ja [--lang en|ja]
 は `config set language` と同等に `language` を保存する。設定更新時の表示言語も、
 指定された新言語を使用する。
 
+### 20.3 廃止シークレット引数の安全な拒否
+
+`add` の引数は `argparse` の解析前に事前走査し、廃止済みの `--secret`、`-s` および
+値を同一トークンに結合した形式（`--secret=VALUE`、`-sVALUE`）を検知する。検知時は
+`argparse` に引数を渡さず、`CommandParseError`（終了コード2、メッセージキー
+`SECRET_ARG_DEPRECATED`、空のコンテキスト）で直ちに終了する。表示は翻訳済みの固定メッセージ
+だけとし、入力された引数列、値、`argparse` の標準エラー文を含めない。これにより、
+`unrecognized arguments: ...` によるシークレット値のエコーバックを防ぐ。
+
 ## 21. ドメイン例外と表示層の連携
 
 ドメイン例外は表示文を保持しない。各例外は終了コード、`MsgKey`、および秘密情報を
@@ -1344,6 +1370,10 @@ raise KeyNotFoundError(context={"path": display_path})
 を維持して `stderr` へ出力する。`str(error)`、traceback、低レベル例外の生メッセージを
 ユーザー出力へ流さない。これにより、core/domain層は言語に依存せず、表示層だけが
 ローカライズ責務を持つ。
+
+廃止された `--secret` / `-s` の検知には、新たな例外型を設けず `CommandParseError` を使う。
+この場合は終了コード `2`、メッセージキー `SECRET_ARG_DEPRECATED`、秘密値や生引数を含まない
+空のコンテキストを設定する。表示層はカタログの固定文だけを出力する。
 
 ## 22. PEメタデータとリリースCI
 
