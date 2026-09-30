@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -828,24 +829,53 @@ class TestSetPrivatePermissionsWindows:
     @pytest.mark.skipif(
         not IS_WINDOWS, reason="実際の icacls による ACL 検証は Windows 専用"
     )
-    def test_created_key_file_has_explicit_owner_only_acl(
-        self, key_manager: KeyManager, tmp_path: Path
+    @pytest.mark.parametrize("parent_inheritable", [True, False])
+    def test_created_key_file_has_protected_dacl_granting_only_current_user(
+        self, key_manager: KeyManager, tmp_path: Path, parent_inheritable: bool
     ) -> None:
-        """実環境で作成された鍵ファイルが継承 ACE を持たず、実行ユーザーのみに付与されていることを確認する。"""
-        target = tmp_path / "master.key"
+        """実環境で作成された鍵ファイルの DACL を、ロケール非依存の SDDL で検証する。
+
+        - 継承が遮断（保護 DACL）され、継承 ACE を一切持たない。
+        - 実行ユーザーの SID にのみ (R,W,D) が付与されている。
+        - それ以外に残り得るのは、親に継承可能 ACE が無い場合にトークンの
+          既定 DACL から明示 ACE として付与される SYSTEM / Administrators のみ。
+          （両者はOS上もともと全ファイルへアクセス可能であり、一般ユーザーへの
+          露出にはならない。`parent_inheritable=False` がこの状況を再現する。）
+        """
+        icacls = KeyManager._icacls_executable()
+        key_dir = tmp_path / "vault"
+        key_dir.mkdir()
+        if not parent_inheritable:
+            account = KeyManager._current_windows_account(key_dir)
+            subprocess.run(
+                [icacls, str(key_dir), "/inheritance:r", "/grant:r", f"{account}:(F)"],
+                check=True,
+                capture_output=True,
+            )
+        target = key_dir / "master.key"
         key_manager.create_key_file(target)
 
-        result = subprocess.run(
-            [KeyManager._icacls_executable(), str(target)],
+        saved_acl = tmp_path / "acl.txt"
+        subprocess.run(
+            [icacls, str(target), "/save", str(saved_acl)],
             check=True,
             capture_output=True,
         )
-        output = result.stdout.decode(errors="replace")
-        account = KeyManager._current_windows_account(target)
-        ace_lines = [line for line in output.splitlines() if ":(" in line]
-        assert len(ace_lines) == 1, output
-        assert ace_lines[0].rstrip().endswith(f"{account}:(R,W,D)")
-        assert "(I)" not in output
+        sddl = saved_acl.read_bytes().decode("utf-16-le").splitlines()[1]
+        whoami = subprocess.run(
+            [str(Path(icacls).with_name("whoami.exe")), "/user", "/fo", "csv", "/nh"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        user_sid = whoami.stdout.strip().split(",")[-1].strip('"')
+
+        assert sddl.startswith("D:P"), sddl
+        aces = [ace.split(";") for ace in re.findall(r"\(([^)]*)\)", sddl)]
+        assert all("ID" not in ace[1] for ace in aces), sddl
+        user_aces = [ace for ace in aces if ace[5] not in {"SY", "BA"}]
+        # 0x13019f = 読み取り(0x120089) | 書き込み(0x100116) | 削除(0x10000)
+        assert user_aces == [["A", "", "0x13019f", "", "", user_sid]], sddl
         assert len(key_manager.load_key(target)) == 32
 
 
