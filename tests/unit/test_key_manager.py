@@ -587,8 +587,8 @@ def _expected_icacls() -> str:
     return str(Path(r"C:\Windows") / "System32" / "icacls.exe")
 
 
-def _normalize_sddl_sid(sid: str) -> str:
-    """SDDL の SID 表記（"LA" 等の別名を含む）を完全な SID 文字列へ変換する（Windows 専用）。"""
+def _win32_security_apis() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
+    """SID/セキュリティ記述子の操作に使う advapi32 と kernel32 を返す（Windows 専用）。"""
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32.ConvertStringSidToSidW.argtypes = [
@@ -599,21 +599,67 @@ def _normalize_sddl_sid(sid: str) -> str:
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p),
     ]
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    return advapi32, kernel32
 
+
+def _sid_to_string(binary_sid: ctypes.c_void_p) -> str:
+    """バイナリ SID を "S-1-..." 形式の文字列へ変換する（Windows 専用）。"""
+    advapi32, kernel32 = _win32_security_apis()
+    string_sid = ctypes.c_void_p()
+    if not advapi32.ConvertSidToStringSidW(binary_sid, ctypes.byref(string_sid)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.wstring_at(string_sid.value)
+    finally:
+        kernel32.LocalFree(string_sid)
+
+
+def _normalize_sddl_sid(sid: str) -> str:
+    """SDDL の SID 表記（"LA" 等の別名を含む）を完全な SID 文字列へ変換する（Windows 専用）。"""
+    advapi32, kernel32 = _win32_security_apis()
     binary_sid = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(binary_sid)):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        string_sid = ctypes.c_void_p()
-        if not advapi32.ConvertSidToStringSidW(binary_sid, ctypes.byref(string_sid)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            return ctypes.wstring_at(string_sid.value)
-        finally:
-            kernel32.LocalFree(string_sid)
+        return _sid_to_string(binary_sid)
     finally:
         kernel32.LocalFree(binary_sid)
+
+
+def _file_owner_sid(path: Path) -> str:
+    """ファイルの所有者 SID を文字列で返す（Windows 専用）。"""
+    se_file_object, owner_security_information = 1, 0x1
+    advapi32, kernel32 = _win32_security_apis()
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        se_file_object,
+        owner_security_information,
+        ctypes.byref(owner),
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        raise ctypes.WinError(status)
+    try:
+        return _sid_to_string(owner)
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
 def _raise_os_error(*args: object, **kwargs: object) -> None:
@@ -867,10 +913,13 @@ class TestSetPrivatePermissionsWindows:
 
         - 継承が遮断（保護 DACL）され、継承 ACE を一切持たない。
         - 実行ユーザーの SID にのみ (R,W,D) が付与されている。
-        - それ以外に残り得るのは、親に継承可能 ACE が無い場合にトークンの
-          既定 DACL から明示 ACE として付与される SYSTEM / Administrators のみ。
-          （両者はOS上もともと全ファイルへアクセス可能であり、一般ユーザーへの
-          露出にはならない。`parent_inheritable=False` がこの状況を再現する。）
+        - それ以外に残り得るのは、親に継承可能 ACE が無い場合などにトークンの
+          既定 DACL 等から明示 ACE として付与される SYSTEM / Administrators /
+          OWNER RIGHTS のみ。SYSTEM と Administrators はOS上もともと全ファイルへ
+          アクセス可能であり、OWNER RIGHTS はファイル所有者にのみ作用する。
+          所有者が実行ユーザーまたは Administrators であることも併せて検証し、
+          一般の他ユーザーへの露出が無いことを保証する。
+          （`parent_inheritable=False` は既定 DACL が適用される状況を再現する。）
         """
         icacls = KeyManager._icacls_executable()
         key_dir = tmp_path / "vault"
@@ -905,7 +954,9 @@ class TestSetPrivatePermissionsWindows:
         assert all("ID" not in ace[1] for ace in aces), sddl
         # SDDL は既知の SID を別名（SY, BA, 組み込み Administrator の LA 等）で
         # 表記するため、完全な SID 文字列へ正規化してから比較する。
-        privileged_sids = {"S-1-5-18", "S-1-5-32-544"}  # SYSTEM, Administrators
+        administrators_sid = "S-1-5-32-544"
+        # SYSTEM, Administrators, OWNER RIGHTS
+        privileged_sids = {"S-1-5-18", administrators_sid, "S-1-3-4"}
         user_aces = [
             [*ace[:5], _normalize_sddl_sid(ace[5])]
             for ace in aces
@@ -913,6 +964,7 @@ class TestSetPrivatePermissionsWindows:
         ]
         # 0x13019f = 読み取り(0x120089) | 書き込み(0x100116) | 削除(0x10000)
         assert user_aces == [["A", "", "0x13019f", "", "", user_sid]], sddl
+        assert _file_owner_sid(target) in {user_sid, administrators_sid}
         assert len(key_manager.load_key(target)) == 32
 
 
