@@ -114,16 +114,20 @@ vtotp init -k "D:\USB\master.key" -l en
 
 ### 2. Register a service (`add`)
 
-Registers a Base32-encoded TOTP secret. Pass it directly with `--secret` (short form: `-s`).
+Registers a Base32-encoded TOTP secret.
+
+For manual use, entering the secret via the interactive prompt (masked input) is recommended as it never touches your terminal history. For scripts and automated pipelines, secrets can be passed via standard input using the `--stdin` option.
+
+> **Note**: Specifying secrets via CLI arguments (`--secret` / `-s`) has been completely removed for security reasons, preventing plaintext secrets from leaking into shell history (`.bash_history`, PowerShell Readline history) or process lists (`ps`, `Get-Process`).
 
 ```powershell
-# Enter it interactively (recommended: it never touches your shell history)
+# Enter interactively (recommended: masked input, never touches shell history)
 vtotp add github
+vtotp add aws --issuer Amazon
 
-# Pass it directly as an argument (--secret / -s)
-vtotp add aws --secret JBSWY3DPEHPK3PXP --issuer Amazon
-vtotp add aws -s JBSWY3DPEHPK3PXP --issuer Amazon
-
+# Pass via standard input pipe (for scripts/automation: requires --stdin)
+echo "JBSWY3DPEHPK3PXP" | vtotp add aws --stdin
+echo "JBSWY3DPEHPK3PXP" | vtotp add aws --issuer Amazon --stdin
 ```
 
 ### 3. Generate a TOTP code (`generate`, aliases: `get` / `-g`, or the shorthand form)
@@ -196,11 +200,12 @@ vtotp's command line follows two rules, chosen to keep behavior predictable for 
 # Valid (SERVICE right after the subcommand; options go afterward, in any order)
 vtotp get github -l ja
 vtotp get github --key "PATH" -l ja
+vtotp add aws --stdin -l ja
 
 # Not supported (rejected with exit code 2)
 vtotp get -l ja github
 vtotp get --key "PATH" github
-
+vtotp add --stdin aws
 ```
 
 ---
