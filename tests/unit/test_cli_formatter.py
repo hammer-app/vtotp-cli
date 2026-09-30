@@ -14,6 +14,7 @@ from vtotp.domain.exceptions import (
     InvalidKeyError,
     InvalidSecretError,
     KeyNotFoundError,
+    KeyStorageError,
     ServiceNotFoundError,
     StorageCorruptedError,
     TotpCliError,
@@ -268,6 +269,12 @@ _EXCEPTION_LOCALIZATION_CASES: list[
 ] = [
     (KeyNotFoundError, MsgKey.KEY_NOT_FOUND, {"path": "C:/keys/master.key"}, 3),
     (InvalidKeyError, MsgKey.KEY_INVALID_SIZE, {"path": "C:/keys/master.key"}, 3),
+    (
+        KeyStorageError,
+        MsgKey.KEY_PERMISSION_SETUP_FAILED,
+        {"path": "C:/keys/master.key"},
+        1,
+    ),
     (StorageCorruptedError, MsgKey.STORAGE_DECRYPTION_FAILED, {}, 4),
     (ServiceNotFoundError, MsgKey.SERVICE_NOT_FOUND, {"service": "github"}, 5),
     (InvalidSecretError, MsgKey.SECRET_INVALID_FORMAT, {}, 6),

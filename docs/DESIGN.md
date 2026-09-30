@@ -199,6 +199,12 @@ class InvalidKeyError(TotpCliError):
     pass
 
 
+class KeyStorageError(TotpCliError):
+    """鍵ファイルの生成・保存またはアクセス権設定に失敗した場合の例外"""
+
+    exit_code: int = 1
+
+
 class StorageCorruptedError(TotpCliError):
     pass
 
@@ -242,7 +248,7 @@ class KeyManager:
         ...
 
     def create_key_file(self, path: Path, key: bytes | None = None) -> None:
-        """鍵を生成または受け取り、指定された外部パスへ保存する"""
+        """鍵を生成または受け取り、安全に一時保存して指定パスへ配置する"""
         ...
 
     def rotate_key_file(self, path: Path, new_key: bytes) -> Path:
@@ -287,17 +293,72 @@ class KeyManager:
     def validate_key_file(self, path: Path) -> None:
         """存在、通常ファイル、サイズ、読み取り可否を検証する"""
         ...
+
+    def set_private_permissions(self, path: Path) -> None:
+        """鍵ファイルを実行ユーザーだけが読み書きできる状態にする"""
+        ...
 ```
 
-### 設計上の注意
+### 鍵ファイル保存とパーミッション制御
+
+鍵の新規作成・更新は、既存ファイルを直接開かず、対象パスと同じディレクトリに
+一時ファイルを作成してから `os.replace` で配置する。`create_key_file` と
+`rotate_key_file` は次の共通フローを使用する。
 
 ```text
-    - 通常の読み込み処理では、指定された外部パスに既存の鍵ファイルがあることを必須にする
-    - initでは、指定された外部パスへ新規鍵を生成・保存する
-    - rekeyでは、既存鍵をpath.1へ退避してから同じpathへ新鍵を保存する
-    - WindowsではACL、Unix系では0600相当の権限を検証する
-- 鍵の内容をエラーメッセージに含めない
+1. 親ディレクトリを作成または検証する。
+2. 予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
+3. 一時ファイルに実行ユーザー専用のパーミッション/ACLを設定する。
+4. 鍵を書き込み、flushおよびfsyncを実行する。
+5. 32バイトであることを検証し、`os.replace(temp_path, path)` で原子的に配置する。
+6. 成功時も失敗時も、一時ファイルが残っていれば削除する。
 ```
+
+`set_private_permissions` は外部依存パッケージを使用せず、OSごとに次の標準機能を
+使う。権限設定は鍵のバイト列を書き込む前に行う。
+
+- **Unix系:** `os.chmod(path, 0o600)` を実行する。所有者以外の読み取り・書き込みを
+    許可しない。
+- **Windows:** `subprocess.run` で標準コマンド `icacls` を呼び出し、継承を無効化して
+    現在のユーザーへ明示的な読み取り・書き込み・削除権限だけを付与する。概念上の実行内容は
+    次の通りであり、実装では `shell=True` を使わず引数配列として渡す。
+
+    ```text
+    <GetSystemDirectoryW()の戻り値>\icacls.exe <path> /inheritance:r /grant:r "*<現在のユーザーSID>:(R,W,D)"
+    ```
+
+    `icacls.exe` のパスは `GetSystemDirectoryW` で取得した System32 の絶対パスから構成し、
+    `SystemRoot` 等の環境変数や PATH 検索には依存しない。ACL の付与先は環境変数や
+    `getpass.getuser()` から推測せず、`OpenProcessToken` と `GetTokenInformation(TokenUser)`
+    で取得したプロセストークンの真のユーザー SID を使用する。SID は `icacls` が受け付ける
+    `*S-1-...` 形式で引数配列に渡す。Win32 API の取得失敗も `KeyStorageError` として処理を
+    中断する。`subprocess.run(..., check=True, capture_output=True)` で終了コードを検査し、
+    標準出力・標準エラーには鍵の内容を含めず、失敗時のコマンド出力もユーザー向け例外へ
+    そのまま流さない。
+
+  - `D`（削除）を含めるのは、親フォルダの権限が「変更」のみ（子の削除権限なし）の
+    環境で、`(R,W)` だけでは `os.replace` による配置・世代繰り上げ・一時ファイル
+    削除が拒否されるためである。付与先は実行ユーザーのみであり、排他性は変わらない。
+  - 親フォルダから継承可能な権限がない場合など、OSまたはトークンの既定 DACL から付与
+    される `SYSTEM`、`Administrators`、`OWNER RIGHTS` の ACE、および現在のログオン
+    セッションを表す Logon SID（`S-1-5-5-...`）の ACE は残存を許容する。これらは
+    Windows の管理・所有者・セッションに結び付くエントリであり、任意の一般ユーザーへ
+    アクセスを許可するものではない。これらの ACE を除く一般ユーザーのアクセスは遮断
+    されていなければならない。
+
+ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace のいずれかが失敗した
+場合は、既存の `pass` で握りつぶさない。`OSError`、`subprocess.CalledProcessError`
+等を秘密情報を含まない `KeyStorageError` へ変換して処理を中断する。一時ファイルの
+削除を `finally` で試み、削除自体にも失敗した場合は元のエラーを優先しつつ、ログには
+鍵の内容を出さない。保存完了前に失敗した場合、既存の正式な鍵ファイルは変更しない。
+
+通常の `load_key` / `verify_key_file` の読み込み経路では、パーミッションやACLの検査を
+強制しない。FAT32 / exFAT のUSBメディアではUnixモードビットやWindows ACLが期待通り
+に保持されないためであり、読み取り時は存在、通常ファイル、読み取り可否、32バイトの
+形式だけを検証する。排他的なパーミッション設定は、鍵ファイルを生成・保存する処理
+に限定する。
+
+鍵の内容を例外メッセージ、ログ、サブプロセス出力へ含めない。
 
 ## 7. SecureStorage
 
@@ -882,6 +943,10 @@ CliHandler
 6   TOTPシークレット不正
 7   ユーザーキャンセル
 ```
+
+鍵ファイルの保存、一時ファイル処理、UnixパーミッションまたはWindows ACL設定の失敗は
+`KeyStorageError` とし、一般的なファイル I/O 失敗として終了コード `1` を返す。
+終了コード `3` は鍵ファイルの不在または形式不正に限る。
 
 ## 16. テスト設計
 

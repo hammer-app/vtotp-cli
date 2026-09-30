@@ -28,6 +28,8 @@ class MsgKey(StrEnum):
     KEY_INVALID_SIZE_NO_PATH = "key_invalid_size_no_path"
     KEY_PERMISSION_DENIED = "key_permission_denied"
     KEY_UNREADABLE = "key_unreadable"
+    KEY_STORAGE_FAILED = "key_storage_failed"
+    KEY_PERMISSION_SETUP_FAILED = "key_permission_setup_failed"
 
     STORAGE_FILE_NOT_FOUND = "storage_file_not_found"
     STORAGE_FILE_UNREADABLE = "storage_file_unreadable"
@@ -102,6 +104,10 @@ EN_CATALOG: Catalog = {
     MsgKey.KEY_INVALID_SIZE_NO_PATH: "Key has an invalid size (must be 32 bytes)",
     MsgKey.KEY_PERMISSION_DENIED: "No permission to read the key file: {path}",
     MsgKey.KEY_UNREADABLE: "Could not read the key file: {path}",
+    MsgKey.KEY_STORAGE_FAILED: "Failed to save the key file: {path}",
+    MsgKey.KEY_PERMISSION_SETUP_FAILED: (
+        "Failed to restrict access to the key file to the current user: {path}"
+    ),
     MsgKey.STORAGE_FILE_NOT_FOUND: "Encrypted storage file not found: {path}",
     MsgKey.STORAGE_FILE_UNREADABLE: "Could not read the encrypted storage file: {path}",
     MsgKey.STORAGE_FILE_INVALID_FORMAT: (
@@ -190,6 +196,10 @@ JA_CATALOG: Catalog = {
     MsgKey.KEY_INVALID_SIZE_NO_PATH: "鍵のサイズが不正です（32バイトである必要があります）",
     MsgKey.KEY_PERMISSION_DENIED: "鍵ファイルを読み取る権限がありません: {path}",
     MsgKey.KEY_UNREADABLE: "鍵ファイルを読み込めません: {path}",
+    MsgKey.KEY_STORAGE_FAILED: "鍵ファイルを保存できませんでした: {path}",
+    MsgKey.KEY_PERMISSION_SETUP_FAILED: (
+        "鍵ファイルのアクセス権限を実行ユーザー専用に設定できませんでした: {path}"
+    ),
     MsgKey.STORAGE_FILE_NOT_FOUND: "暗号化データファイルが見つかりません: {path}",
     MsgKey.STORAGE_FILE_UNREADABLE: "暗号化データファイルを読み込めません: {path}",
     MsgKey.STORAGE_FILE_INVALID_FORMAT: "暗号化データファイルの形式が不正です: {path}",
