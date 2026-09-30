@@ -202,6 +202,8 @@ class InvalidKeyError(TotpCliError):
 class KeyStorageError(TotpCliError):
     """鍵ファイルの生成・保存またはアクセス権設定に失敗した場合の例外"""
 
+    exit_code: int = 1
+
 
 class StorageCorruptedError(TotpCliError):
     pass
@@ -322,19 +324,27 @@ class KeyManager:
     次の通りであり、実装では `shell=True` を使わず引数配列として渡す。
 
     ```text
-    %SystemRoot%\System32\icacls.exe <path> /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:(R,W,D)"
+    <GetSystemDirectoryW()の戻り値>\icacls.exe <path> /inheritance:r /grant:r "*<現在のユーザーSID>:(R,W,D)"
     ```
 
-    `%USERDOMAIN%\%USERNAME%` は実行時の現在ユーザー名に解決し（`USERNAME` が無い場合は
-    `getpass.getuser()`、`USERDOMAIN` が無い場合はユーザー名のみ）、`subprocess.run(...,
-    check=True, capture_output=True)` で終了コードを検査する。標準出力・標準エラーには
-    鍵の内容を含めず、失敗時のコマンド出力もユーザー向け例外へそのまま流さない。
+    `icacls.exe` のパスは `GetSystemDirectoryW` で取得した System32 の絶対パスから構成し、
+    `SystemRoot` 等の環境変数や PATH 検索には依存しない。ACL の付与先は環境変数や
+    `getpass.getuser()` から推測せず、`OpenProcessToken` と `GetTokenInformation(TokenUser)`
+    で取得したプロセストークンの真のユーザー SID を使用する。SID は `icacls` が受け付ける
+    `*S-1-...` 形式で引数配列に渡す。Win32 API の取得失敗も `KeyStorageError` として処理を
+    中断する。`subprocess.run(..., check=True, capture_output=True)` で終了コードを検査し、
+    標準出力・標準エラーには鍵の内容を含めず、失敗時のコマンド出力もユーザー向け例外へ
+    そのまま流さない。
 
   - `D`（削除）を含めるのは、親フォルダの権限が「変更」のみ（子の削除権限なし）の
     環境で、`(R,W)` だけでは `os.replace` による配置・世代繰り上げ・一時ファイル
     削除が拒否されるためである。付与先は実行ユーザーのみであり、排他性は変わらない。
-  - `icacls` は `System32` の絶対パスで指定する。コマンド名だけを渡すと、Windowsの
-    プロセス生成はカレントディレクトリを `System32` より先に探索するためである。
+  - 親フォルダから継承可能な権限がない場合など、OSまたはトークンの既定 DACL から付与
+    される `SYSTEM`、`Administrators`、`OWNER RIGHTS` の ACE、および現在のログオン
+    セッションを表す Logon SID（`S-1-5-5-...`）の ACE は残存を許容する。これらは
+    Windows の管理・所有者・セッションに結び付くエントリであり、任意の一般ユーザーへ
+    アクセスを許可するものではない。これらの ACE を除く一般ユーザーのアクセスは遮断
+    されていなければならない。
 
 ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace のいずれかが失敗した
 場合は、既存の `pass` で握りつぶさない。`OSError`、`subprocess.CalledProcessError`
@@ -933,6 +943,10 @@ CliHandler
 6   TOTPシークレット不正
 7   ユーザーキャンセル
 ```
+
+鍵ファイルの保存、一時ファイル処理、UnixパーミッションまたはWindows ACL設定の失敗は
+`KeyStorageError` とし、一般的なファイル I/O 失敗として終了コード `1` を返す。
+終了コード `3` は鍵ファイルの不在または形式不正に限る。
 
 ## 16. テスト設計
 
