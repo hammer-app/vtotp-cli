@@ -16,7 +16,9 @@ import pytest
 from vtotp.cli.handler import CliHandler, ENV_KEY_PATH_VARIABLE
 from vtotp.core.key_manager import KeyManager
 from vtotp.core.secure_storage import SecureStorage
+from vtotp.domain.exceptions import CommandParseError
 from vtotp.domain.models import SecretRecord
+from vtotp.i18n.catalog import EN_CATALOG, JA_CATALOG, MsgKey
 from vtotp.i18n.resolver import ENV_LANG_VARIABLE
 
 
@@ -915,33 +917,6 @@ class TestAddCommand:
         assert "JBSWY3DPEHPK3PXP" not in combined
         assert "0xff" not in combined
 
-    @pytest.mark.parametrize(
-        "secret_args",
-        [
-            ["--secret", "JBSWY3DPEHPK3PXP"],
-            ["-s", "JBSWY3DPEHPK3PXP"],
-            ["--secret=JBSWY3DPEHPK3PXP"],
-            ["-sJBSWY3DPEHPK3PXP"],
-        ],
-    )
-    def test_removed_secret_option_returns_exit_code_2(
-        self,
-        handler_factory: Callable[..., CliHandler],
-        initialized_handler: tuple[CliHandler, Path],
-        config_path: Path,
-        stderr: io.StringIO,
-        secret_args: list[str],
-    ) -> None:
-        """廃止された`--secret`/`-s`が未知の引数として終了コード2で拒否され、
-        対話プロンプトも表示されず、何も登録されないことを確認する。
-        """
-        _, key_path = initialized_handler
-        handler = handler_factory(["KRSXG5CTMVRXEZLU"])
-        exit_code = handler.run(["add", "github", "--key", str(key_path), *secret_args])
-        assert exit_code == 2
-        assert "Enter the TOTP secret" not in stderr.getvalue()
-        assert self._load_records(config_path, key_path) == {}
-
     def test_add_prompts_for_secret_when_stdin_option_omitted(
         self,
         handler_factory: Callable[..., CliHandler],
@@ -1118,6 +1093,157 @@ class TestAddCommand:
 
         combined = stdout.getvalue() + stderr.getvalue()
         assert invalid_secret not in combined
+
+
+#: 廃止引数のテストで渡すシークレット値（stdout/stderrに現れてはならない）。
+_DEPRECATED_ARG_SECRET = "GEZDGNBVGY3TQOJQ"
+
+
+class TestDeprecatedSecretArgRejection:
+    """廃止済み`--secret`/`-s`の事前検査とエコーバック防止に関するテスト（DESIGN.md 20.3）。"""
+
+    @staticmethod
+    def _storage_is_empty(config_path: Path, key_path: Path) -> bool:
+        records = SecureStorage().load_secrets(
+            config_path.parent / "vtotp-secrets.enc", key_path.read_bytes()
+        )
+        return records == {}
+
+    @pytest.mark.parametrize(
+        "secret_args",
+        [
+            ["--secret", _DEPRECATED_ARG_SECRET],
+            ["-s", _DEPRECATED_ARG_SECRET],
+            [f"--secret={_DEPRECATED_ARG_SECRET}"],
+            [f"-s{_DEPRECATED_ARG_SECRET}"],
+            ["--sec", _DEPRECATED_ARG_SECRET],
+            [f"--secre={_DEPRECATED_ARG_SECRET}"],
+            ["--stdin", "--secret", _DEPRECATED_ARG_SECRET],
+            ["--issuer", "GitHub", "-s", _DEPRECATED_ARG_SECRET],
+            ["--", "--secret", _DEPRECATED_ARG_SECRET],
+        ],
+    )
+    def test_deprecated_secret_arg_is_rejected_without_echoing_value(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        config_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        secret_args: list[str],
+    ) -> None:
+        """`--secret`/`-s`（結合形式・省略形を含む）が終了コード2で拒否され、stderrには
+        固定の`SECRET_ARG_DEPRECATED`文言だけが出力され、シークレット値は一切含まれない
+        ことを確認する。
+        """
+        _, key_path = initialized_handler
+        handler = handler_factory(
+            [_DEPRECATED_ARG_SECRET], stdin=f"{_DEPRECATED_ARG_SECRET}\n"
+        )
+        exit_code = handler.run(["add", "github", "--key", str(key_path), *secret_args])
+
+        assert exit_code == 2
+        expected_message = EN_CATALOG[MsgKey.SECRET_ARG_DEPRECATED]
+        assert stderr.getvalue() == f"Error: {expected_message}\n"
+        assert _DEPRECATED_ARG_SECRET not in stderr.getvalue()
+        assert _DEPRECATED_ARG_SECRET not in stdout.getvalue()
+        assert "unrecognized arguments" not in stderr.getvalue()
+        assert self._storage_is_empty(config_path, key_path)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["add", "--secret", _DEPRECATED_ARG_SECRET, "github"],
+            ["add", f"-s{_DEPRECATED_ARG_SECRET}", "github"],
+        ],
+    )
+    def test_deprecated_secret_arg_before_service_takes_precedence(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        stderr: io.StringIO,
+        argv: list[str],
+    ) -> None:
+        """SERVICEより前に置かれた場合も、位置検証ではなく廃止引数のメッセージで拒否されることを確認する。"""
+        handler = handler_factory()
+        exit_code = handler.run(argv)
+        assert exit_code == 2
+        assert EN_CATALOG[MsgKey.SECRET_ARG_DEPRECATED] in stderr.getvalue()
+        assert _DEPRECATED_ARG_SECRET not in stderr.getvalue()
+
+    def test_rejection_message_is_localized_to_japanese(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        initialized_handler: tuple[CliHandler, Path],
+        stderr: io.StringIO,
+    ) -> None:
+        """`-l ja`指定時、廃止引数の拒否メッセージが日本語で表示されることを確認する。"""
+        _, key_path = initialized_handler
+        handler = handler_factory()
+        exit_code = handler.run(
+            [
+                "add",
+                "github",
+                "--key",
+                str(key_path),
+                "--secret",
+                _DEPRECATED_ARG_SECRET,
+                "-l",
+                "ja",
+            ]
+        )
+        assert exit_code == 2
+        assert stderr.getvalue() == (
+            f"エラー: {JA_CATALOG[MsgKey.SECRET_ARG_DEPRECATED]}\n"
+        )
+        assert _DEPRECATED_ARG_SECRET not in stderr.getvalue()
+
+    @pytest.mark.parametrize(
+        "secret_token",
+        [
+            "--secret",
+            f"--secret={_DEPRECATED_ARG_SECRET}",
+            f"-s{_DEPRECATED_ARG_SECRET}",
+        ],
+    )
+    def test_raised_error_carries_no_secret_or_raw_arguments(
+        self, handler_factory: Callable[..., CliHandler], secret_token: str
+    ) -> None:
+        """送出される`CommandParseError`が終了コード2・`SECRET_ARG_DEPRECATED`・空の
+        コンテキストのみを持ち、引数列やシークレット値を保持しないことを確認する。
+        """
+        handler = handler_factory()
+        with pytest.raises(CommandParseError) as exc_info:
+            handler.reject_deprecated_secret_args(
+                ["add", "github", secret_token, _DEPRECATED_ARG_SECRET]
+            )
+
+        error = exc_info.value
+        assert error.exit_code == 2
+        assert error.message_key is MsgKey.SECRET_ARG_DEPRECATED
+        assert dict(error.context) == {}
+        assert _DEPRECATED_ARG_SECRET not in str(error)
+        assert _DEPRECATED_ARG_SECRET not in repr(error.args)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            [],
+            ["generate", "github", "-s", _DEPRECATED_ARG_SECRET],
+            ["add", "github"],
+            ["add", "github", "--stdin", "--storage", "PATH", "--issuer", "X"],
+            ["add", "github", "--st", "-k", "PATH", "-l", "ja", "-h"],
+            ["add", "github", "--s"],
+            ["add", "github", "--storage=--secret-store.enc"],
+        ],
+    )
+    def test_non_deprecated_arguments_pass_through(
+        self, handler_factory: Callable[..., CliHandler], argv: list[str]
+    ) -> None:
+        """`add`以外のコマンドや、現行オプション（`--stdin`/`--storage`等・`--s`/`--st`の
+        曖昧な省略形）は事前検査で誤検知されず、後続の解析へ委ねられることを確認する。
+        """
+        handler = handler_factory()
+        handler.reject_deprecated_secret_args(argv)
 
 
 class TestListCommand:

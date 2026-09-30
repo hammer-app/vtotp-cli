@@ -56,6 +56,28 @@ _QUOTE_CHARS = "\"'"
 #: `add --stdin` で読み込んだシークレットの末尾から除去する改行文字。
 _TRAILING_NEWLINE_CHARS = "\r\n"
 
+#: 廃止済みのシークレット引数（長形式・短形式）。
+_DEPRECATED_SECRET_LONG_OPTION = "--secret"
+_DEPRECATED_SECRET_SHORT_OPTION = "-s"
+
+#: argparseの前方一致（`--sec`等）で`--secret`の省略形とみなす最短の長さ。
+#: `--s`は現行の`--stdin`/`--storage`とも共通する接頭辞のため対象外とする。
+_DEPRECATED_SECRET_MIN_PREFIX_LENGTH = len("--se")
+
+
+def _is_deprecated_secret_arg(token: str) -> bool:
+    """`token`が廃止済みの`--secret`/`-s`（値の結合形式・省略形を含む）かを判定する。
+
+    対象は `--secret`、`--secret=VALUE`、`--sec` 等の前方一致省略形、
+    および `-s`、`-sVALUE` である。
+    """
+    if token.startswith("--"):
+        option_name = token.split("=", 1)[0]
+        if len(option_name) < _DEPRECATED_SECRET_MIN_PREFIX_LENGTH:
+            return False
+        return _DEPRECATED_SECRET_LONG_OPTION.startswith(option_name)
+    return token.startswith(_DEPRECATED_SECRET_SHORT_OPTION)
+
 
 def _read_masked_input() -> str:
     """入力内容をエコーせずに（マスキングして）1行を読み込む。
@@ -245,6 +267,7 @@ class CliHandler:
         )
 
         try:
+            self.reject_deprecated_secret_args(normalized_argv)
             self._validate_service_position(normalized_argv)
             parsed_args = self._parser.parse_args(normalized_argv)
         except SystemExit as exc:
@@ -297,6 +320,23 @@ class CliHandler:
         if first in self.RESERVED_COMMANDS or first.startswith("-"):
             return list(argv)
         return ["generate", first, *argv[1:]]
+
+    def reject_deprecated_secret_args(self, argv: Sequence[str]) -> None:
+        """`add` の引数に廃止済みの `--secret`/`-s` が含まれていれば拒否する。
+
+        argparseへ渡すと、未知の引数として `unrecognized arguments: --secret
+        VALUE` のようにシークレット値をstderrへエコーバックしてしまうため、
+        解析より前に検知し、固定メッセージの :class:`CommandParseError`
+        （終了コード2）へ変換する。引数列や値は例外コンテキストへ一切含め
+        ない（DESIGN.md 20.3、Zero Leakage Rule）。`--` 以降のトークンも
+        argparseは未知の引数としてエコーバックするため、同様に検査対象とする。
+        SERVICEより前に置かれた場合も、位置検証より優先してこのメッセージで
+        拒否する。
+        """
+        if not argv or argv[0] != "add":
+            return
+        if any(_is_deprecated_secret_arg(token) for token in argv[1:]):
+            raise CommandParseError(MsgKey.SECRET_ARG_DEPRECATED, context={})
 
     def _validate_service_position(self, argv: Sequence[str]) -> None:
         """`SERVICE` を必須とするコマンドで、サブコマンド直後に `SERVICE` が
@@ -374,7 +414,8 @@ class CliHandler:
         add_parser.add_argument("service")
         # シークレットをCLI引数で受け取る`--secret`/`-s`は、シェル履歴・プロセス
         # 一覧への露出を防ぐため廃止済み（REQUIREMENTS.md 3.4 / 4.1）。指定された
-        # 場合は未知の引数として終了コード2で拒否される。
+        # 場合は、argparseへ渡す前に`reject_deprecated_secret_args`が値をエコー
+        # バックしない固定メッセージ（終了コード2）で拒否する。
         add_parser.add_argument("--issuer", default=None)
         add_parser.add_argument("--stdin", action="store_true")
         add_parser.add_argument("-k", "--key", type=_type_path, default=None)
