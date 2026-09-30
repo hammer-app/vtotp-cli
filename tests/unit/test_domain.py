@@ -32,7 +32,7 @@ class TestExceptionHierarchy:
         [
             (KeyNotFoundError, 3),
             (InvalidKeyError, 3),
-            (KeyStorageError, 3),
+            (KeyStorageError, 1),
             (StorageCorruptedError, 4),
             (ServiceNotFoundError, 5),
             (InvalidSecretError, 6),

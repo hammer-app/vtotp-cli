@@ -479,7 +479,7 @@ class TestInitCommand:
         assert exit_code == 2
         assert "cannot be empty" in stderr.getvalue()
 
-    def test_invalid_windows_path_characters_return_exit_code_3_without_crashing(
+    def test_invalid_windows_path_characters_return_exit_code_1_without_crashing(
         self,
         handler_factory: Callable[..., CliHandler],
         tmp_path: Path,
@@ -487,7 +487,7 @@ class TestInitCommand:
         stderr: io.StringIO,
     ) -> None:
         """Windowsで不正な文字を含むパスを指定した場合、トレースバックを出さず
-        鍵保存失敗（KeyStorageError、終了コード3）として扱われることを確認する。
+        鍵保存失敗（KeyStorageError、終了コード1）として扱われることを確認する。
         """
         if not sys.platform.startswith("win"):
             pytest.skip(
@@ -499,7 +499,7 @@ class TestInitCommand:
 
         exit_code = handler.run(["init", "--key", str(invalid_key_path)])
 
-        assert exit_code == 3
+        assert exit_code == 1
         assert stdout.getvalue() == ""
         assert "Failed to save the key file" in stderr.getvalue()
         # 未処理のPythonトレースバック（"Traceback (most recent call last)"）が
@@ -515,7 +515,7 @@ class TestInitCommand:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """鍵ファイル作成時にOSErrorが発生した場合でも、run()がクラッシュせず
-        KeyStorageError（終了コード3）としてわかりやすいエラーメッセージを返す
+        KeyStorageError（終了コード1）としてわかりやすいエラーメッセージを返す
         ことを確認する（プラットフォームに依存しない決定的な検証）。
         """
 
@@ -529,7 +529,7 @@ class TestInitCommand:
 
         exit_code = handler.run(["init", "--key", str(key_path)])
 
-        assert exit_code == 3
+        assert exit_code == 1
         assert stdout.getvalue() == ""
         assert f"Failed to save the key file: {key_path}" in stderr.getvalue()
         assert "simulated invalid path syntax" not in stderr.getvalue()
@@ -543,7 +543,7 @@ class TestInitCommand:
         stderr: io.StringIO,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """鍵ファイルの権限設定に失敗した場合、initが終了コード3で中断し、
+        """鍵ファイルの権限設定に失敗した場合、initが終了コード1で中断し、
         鍵ファイル・一時ファイル・暗号化データを一切残さないことを確認する。
         """
 
@@ -559,7 +559,7 @@ class TestInitCommand:
 
         exit_code = handler.run(["init", "--key", str(key_path)])
 
-        assert exit_code == 3
+        assert exit_code == 1
         assert stdout.getvalue() == ""
         assert "Failed to restrict access to the key file" in stderr.getvalue()
         assert "Traceback" not in stderr.getvalue()
@@ -1136,7 +1136,7 @@ class TestRekeyCommand:
         stderr: io.StringIO,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """新鍵の権限設定に失敗した場合、rekeyが終了コード3で中断し、
+        """新鍵の権限設定に失敗した場合、rekeyが終了コード1で中断し、
         旧鍵・暗号化データがそのまま利用可能であることを確認する（フェイルセーフ）。
         """
         _, key_path = initialized_handler
@@ -1153,7 +1153,7 @@ class TestRekeyCommand:
             patch.setattr("subprocess.run", _raise_os_error)
             exit_code = handler_factory().run(["rekey", "--key", str(key_path)])
 
-        assert exit_code == 3
+        assert exit_code == 1
         assert "Failed to restrict access to the key file" in stderr.getvalue()
         assert key_path.read_bytes() == old_key_bytes
         assert not Path(f"{key_path}.1").exists()

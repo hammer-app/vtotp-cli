@@ -9,12 +9,13 @@ CLI/環境変数/config.jsonからのパス解決、および世代管理（ロ�
 from __future__ import annotations
 
 import contextlib
-import getpass
+import ctypes
 import os
 import secrets
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from vtotp.domain.exceptions import (
     InvalidKeyError,
@@ -27,6 +28,119 @@ from vtotp.i18n.catalog import MsgKey
 def _is_windows() -> bool:
     """実行環境がWindowsかどうかを返す（テストで差し替え可能にするための関数）。"""
     return os.name == "nt"
+
+
+#: `OpenProcessToken` の要求アクセス権（トークン情報の参照のみ）。
+_TOKEN_QUERY: int = 0x0008
+
+#: `GetTokenInformation` の情報クラス `TokenUser`。
+_TOKEN_USER_CLASS: int = 1
+
+#: `GetSystemDirectoryW` に渡すバッファの文字数（拡張パス長の上限）。
+_SYSTEM_DIRECTORY_BUFFER_CHARS: int = 32768
+
+
+def _load_windows_library(name: str) -> Any:
+    """Win32 のDLLを読み込む（テストで偽のDLLへ差し替え可能にするための関数）。
+
+    `ctypes.WinDLL` はWindowsでのみ提供されるため、存在しない環境では
+    :class:`OSError` を送出する。
+    """
+    loader = getattr(ctypes, "WinDLL", None)
+    if loader is None:
+        raise OSError(f"{name} is only available on Windows")
+    return loader(name, use_last_error=True)
+
+
+def _windows_system_directory() -> str:
+    """`GetSystemDirectoryW` で実際の System32 ディレクトリの絶対パスを返す。
+
+    `SystemRoot` 等の環境変数には依存しない。取得に失敗した場合は
+    :class:`OSError` を送出する。
+    """
+    kernel32 = _load_windows_library("kernel32")
+    kernel32.GetSystemDirectoryW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    kernel32.GetSystemDirectoryW.restype = ctypes.c_uint32
+
+    buffer = ctypes.create_unicode_buffer(_SYSTEM_DIRECTORY_BUFFER_CHARS)
+    length = kernel32.GetSystemDirectoryW(buffer, _SYSTEM_DIRECTORY_BUFFER_CHARS)
+    if not 0 < length < _SYSTEM_DIRECTORY_BUFFER_CHARS:
+        raise OSError("GetSystemDirectoryW failed")
+    return buffer.value
+
+
+def _current_user_sid() -> str:
+    """現在のプロセストークンからユーザー SID（`S-1-5-21-...` 形式）を返す。
+
+    環境変数や `getpass.getuser()` には依存せず、`OpenProcessToken` と
+    `GetTokenInformation(TokenUser)` で取得した SID を
+    `ConvertSidToStringSidW` で文字列化する。トークンハンドルと文字列 SID の
+    領域は必ず解放する。取得に失敗した場合は :class:`OSError` を送出する。
+    """
+    advapi32 = _load_windows_library("advapi32")
+    kernel32 = _load_windows_library("kernel32")
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.OpenProcessToken.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.OpenProcessToken.restype = ctypes.c_int
+    advapi32.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    advapi32.GetTokenInformation.restype = ctypes.c_int
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+    ):
+        raise OSError("OpenProcessToken failed")
+    try:
+        # 1回目の呼び出しで TOKEN_USER に必要なバッファサイズを取得する
+        # （この呼び出し自体はバッファ不足で失敗するのが正常）。
+        required_size = ctypes.c_uint32(0)
+        advapi32.GetTokenInformation(
+            token, _TOKEN_USER_CLASS, None, 0, ctypes.byref(required_size)
+        )
+        if required_size.value == 0:
+            raise OSError("GetTokenInformation(TokenUser) returned no size")
+        token_user = ctypes.create_string_buffer(required_size.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            _TOKEN_USER_CLASS,
+            token_user,
+            required_size.value,
+            ctypes.byref(required_size),
+        ):
+            raise OSError("GetTokenInformation(TokenUser) failed")
+
+        # TOKEN_USER は SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; } で
+        # 始まるため、先頭のポインタ値がユーザー SID を指す。
+        user_sid = ctypes.cast(token_user, ctypes.POINTER(ctypes.c_void_p))[0]
+        string_sid = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(user_sid, ctypes.byref(string_sid)):
+            raise OSError("ConvertSidToStringSidW failed")
+        try:
+            return ctypes.wstring_at(string_sid)
+        finally:
+            kernel32.LocalFree(string_sid)
+    finally:
+        kernel32.CloseHandle(token)
 
 
 class KeyManager:
@@ -157,7 +271,8 @@ class KeyManager:
 
         Unix系では `os.chmod(path, 0o600)` を実行する。Windowsでは標準コマンド
         `icacls` を引数配列（`shell=False`）で呼び出し、親フォルダからの継承を
-        遮断したうえで実行ユーザーのみに権限を付与する。いずれの失敗も
+        遮断したうえで、プロセストークンから取得した実行ユーザーの SID
+        （`*S-1-...` 形式）のみに権限を付与する。Win32 APIの失敗を含め、いずれの失敗も
         握りつぶさず :class:`KeyStorageError` として送出する。OSのエラー詳細や
         コマンド出力は例外の表示内容に含めない（Zero Leakage Rule）。
         """
@@ -171,17 +286,18 @@ class KeyManager:
                 ) from exc
             return
 
-        command = [
-            self._icacls_executable(),
-            str(path),
-            "/inheritance:r",
-            "/grant:r",
-            f"{self._current_windows_account(path)}:{self.WINDOWS_PRIVATE_GRANT}",
-        ]
         try:
+            command = [
+                self._icacls_executable(),
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"*{_current_user_sid()}:{self.WINDOWS_PRIVATE_GRANT}",
+            ]
             subprocess.run(command, check=True, capture_output=True)
         except (OSError, subprocess.SubprocessError):
-            # コマンド出力を例外チェーンにも残さないよう、原因は連結しない。
+            # Win32 APIの失敗詳細やコマンド出力を例外チェーンにも残さないよう、
+            # 原因は連結しない。
             raise KeyStorageError(
                 MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
             ) from None
@@ -277,24 +393,7 @@ class KeyManager:
 
         `shell=False` でもコマンド名のみを渡すと、Windowsのプロセス生成は
         カレントディレクトリを `System32` より先に探索する。同名の不正な
-        実行ファイルを誤って起動しないよう、システムディレクトリを明示する。
+        実行ファイルを誤って起動しないよう、`GetSystemDirectoryW` で取得した
+        システムディレクトリを明示する（環境変数には依存しない）。
         """
-        system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-        return str(Path(system_root) / "System32" / "icacls.exe")
-
-    @staticmethod
-    def _current_windows_account(path: Path) -> str:
-        """ACL付与対象となる実行ユーザーのアカウント名（`DOMAIN\\user`）を返す。
-
-        取得できない場合は :class:`KeyStorageError` を送出する。
-        """
-        try:
-            username = os.environ.get("USERNAME") or getpass.getuser()
-        except (OSError, ImportError, KeyError):
-            username = ""
-        if not username:
-            raise KeyStorageError(
-                MsgKey.KEY_PERMISSION_SETUP_FAILED, context={"path": str(path)}
-            )
-        domain = os.environ.get("USERDOMAIN")
-        return f"{domain}\\{username}" if domain else username
+        return str(Path(_windows_system_directory()) / "icacls.exe")

@@ -273,7 +273,7 @@ _EXCEPTION_LOCALIZATION_CASES: list[
         KeyStorageError,
         MsgKey.KEY_PERMISSION_SETUP_FAILED,
         {"path": "C:/keys/master.key"},
-        3,
+        1,
     ),
     (StorageCorruptedError, MsgKey.STORAGE_DECRYPTION_FAILED, {}, 4),
     (ServiceNotFoundError, MsgKey.SERVICE_NOT_FOUND, {"service": "github"}, 5),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import getpass
 import os
 import re
 import stat
@@ -11,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -565,13 +566,21 @@ def force_unix(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(key_manager_module, "_is_windows", lambda: False)
 
 
+#: 偽の Win32 API が返す実行ユーザーの SID。
+_FAKE_USER_SID = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+
 @pytest.fixture
 def force_windows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """実行OSに関わらず、Windowsの権限設定経路を通るようにする。"""
+    """実行OSに関わらず、Windowsの権限設定経路を通るようにする。
+
+    System32 とユーザー SID の取得（Win32 API）は固定値を返す偽関数へ差し替える。
+    """
     monkeypatch.setattr(key_manager_module, "_is_windows", lambda: True)
-    monkeypatch.setenv("SystemRoot", r"C:\Windows")
-    monkeypatch.setenv("USERNAME", "alice")
-    monkeypatch.setenv("USERDOMAIN", "WORKGROUP")
+    monkeypatch.setattr(
+        key_manager_module, "_windows_system_directory", lambda: r"C:\Windows\System32"
+    )
+    monkeypatch.setattr(key_manager_module, "_current_user_sid", lambda: _FAKE_USER_SID)
 
 
 @pytest.fixture
@@ -584,7 +593,19 @@ def run_recorder(monkeypatch: pytest.MonkeyPatch) -> _RunRecorder:
 
 def _expected_icacls() -> str:
     """force_windows 環境下で期待される icacls.exe の絶対パスを返す。"""
-    return str(Path(r"C:\Windows") / "System32" / "icacls.exe")
+    return str(Path(r"C:\Windows\System32") / "icacls.exe")
+
+
+def _whoami_user_sid() -> str:
+    """System32 の whoami.exe から実行ユーザーの SID を取得する（Windows 専用の独立した検証手段）。"""
+    whoami = Path(key_manager_module._windows_system_directory()) / "whoami.exe"
+    result = subprocess.run(
+        [str(whoami), "/user", "/fo", "csv", "/nh"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip().split(",")[-1].strip('"')
 
 
 def _win32_security_apis() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
@@ -736,7 +757,7 @@ class TestSetPrivatePermissionsWindows:
         force_windows: None,
         run_recorder: _RunRecorder,
     ) -> None:
-        """継承遮断と実行ユーザー専用の付与を、shell を使わず引数配列で渡すことを確認する。"""
+        """継承遮断と、ユーザー SID 直指定による付与を shell を使わず引数配列で渡すことを確認する。"""
         target = tmp_path / "master.key"
 
         key_manager.set_private_permissions(target)
@@ -748,11 +769,30 @@ class TestSetPrivatePermissionsWindows:
                     str(target),
                     "/inheritance:r",
                     "/grant:r",
-                    "WORKGROUP\\alice:(R,W,D)",
+                    f"*{_FAKE_USER_SID}:(R,W,D)",
                 ],
                 {"check": True, "capture_output": True},
             )
         ]
+
+    def test_does_not_depend_on_user_or_system_environment_variables(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """USERNAME・USERDOMAIN・SystemRoot を改ざんしても付与対象と実行ファイルが変わらないことを確認する。"""
+        monkeypatch.setenv("USERNAME", "attacker")
+        monkeypatch.setenv("USERDOMAIN", "EVIL")
+        monkeypatch.setenv("SystemRoot", r"C:\evil")
+
+        key_manager.set_private_permissions(tmp_path / "master.key")
+
+        command = run_recorder.calls[0][0]
+        assert command[0] == _expected_icacls()
+        assert command[-1] == f"*{_FAKE_USER_SID}:(R,W,D)"
 
     def test_does_not_call_chmod(
         self,
@@ -767,66 +807,26 @@ class TestSetPrivatePermissionsWindows:
         key_manager.set_private_permissions(tmp_path / "master.key")
         assert len(run_recorder.calls) == 1
 
-    def test_account_without_domain(
-        self,
-        key_manager: KeyManager,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        force_windows: None,
-        run_recorder: _RunRecorder,
-    ) -> None:
-        """USERDOMAIN が無い場合はユーザー名のみを付与対象にすることを確認する。"""
-        monkeypatch.delenv("USERDOMAIN")
-        key_manager.set_private_permissions(tmp_path / "master.key")
-        assert run_recorder.calls[0][0][-1] == "alice:(R,W,D)"
-
-    def test_falls_back_to_getpass_when_username_is_unset(
-        self,
-        key_manager: KeyManager,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        force_windows: None,
-        run_recorder: _RunRecorder,
-    ) -> None:
-        """環境変数 USERNAME が無い場合は getpass.getuser() の結果を使うことを確認する。"""
-        monkeypatch.delenv("USERNAME")
-        monkeypatch.setattr(getpass, "getuser", lambda: "bob")
-        key_manager.set_private_permissions(tmp_path / "master.key")
-        assert run_recorder.calls[0][0][-1] == "WORKGROUP\\bob:(R,W,D)"
-
-    def test_uses_default_system_root_when_unset(
-        self,
-        key_manager: KeyManager,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        force_windows: None,
-        run_recorder: _RunRecorder,
-    ) -> None:
-        """SystemRoot が無い場合も System32 配下の icacls.exe を絶対パスで指定することを確認する。"""
-        monkeypatch.delenv("SystemRoot")
-        key_manager.set_private_permissions(tmp_path / "master.key")
-        assert run_recorder.calls[0][0][0] == _expected_icacls()
-
     @pytest.mark.parametrize(
-        "error",
-        [OSError("no user"), ImportError("No module named 'pwd'"), KeyError("uid")],
+        "failing_helper", ["_current_user_sid", "_windows_system_directory"]
     )
-    def test_user_lookup_failure_raises_key_storage_error(
+    def test_win32_lookup_failure_raises_key_storage_error(
         self,
         key_manager: KeyManager,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         force_windows: None,
         run_recorder: _RunRecorder,
-        error: BaseException,
+        failing_helper: str,
     ) -> None:
-        """実行ユーザー名を取得できない場合、icacls を呼ばずに KeyStorageError になることを確認する。"""
-        monkeypatch.delenv("USERNAME")
+        """ユーザー SID または System32 の取得に失敗した場合、icacls を呼ばずに
+        KeyStorageError となり、Win32 API の失敗詳細を例外に残さないことを確認する。
+        """
 
-        def _raise() -> str:
-            raise error
+        def _fail() -> str:
+            raise OSError("SENTINEL-WIN32")
 
-        monkeypatch.setattr(getpass, "getuser", _raise)
+        monkeypatch.setattr(key_manager_module, failing_helper, _fail)
         target = tmp_path / "master.key"
 
         with pytest.raises(KeyStorageError) as excinfo:
@@ -834,21 +834,8 @@ class TestSetPrivatePermissionsWindows:
 
         assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
         assert excinfo.value.context == {"path": str(target)}
-        assert run_recorder.calls == []
-
-    def test_empty_user_name_raises_key_storage_error(
-        self,
-        key_manager: KeyManager,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        force_windows: None,
-        run_recorder: _RunRecorder,
-    ) -> None:
-        """ユーザー名が空文字列の場合も KeyStorageError になることを確認する。"""
-        monkeypatch.setenv("USERNAME", "")
-        monkeypatch.setattr(getpass, "getuser", lambda: "")
-        with pytest.raises(KeyStorageError):
-            key_manager.set_private_permissions(tmp_path / "master.key")
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
         assert run_recorder.calls == []
 
     @pytest.mark.parametrize(
@@ -915,19 +902,26 @@ class TestSetPrivatePermissionsWindows:
         - 実行ユーザーの SID にのみ (R,W,D) が付与されている。
         - それ以外に残り得るのは、親に継承可能 ACE が無い場合などにトークンの
           既定 DACL 等から明示 ACE として付与される SYSTEM / Administrators /
-          OWNER RIGHTS のみ。SYSTEM と Administrators はOS上もともと全ファイルへ
-          アクセス可能であり、OWNER RIGHTS はファイル所有者にのみ作用する。
-          所有者が実行ユーザーまたは Administrators であることも併せて検証し、
-          一般の他ユーザーへの露出が無いことを保証する。
+          OWNER RIGHTS、および現在のログオンセッションを表す Logon SID
+          （`S-1-5-5-X-Y`）のみ（REQUIREMENTS.md 4.1 の注記）。SYSTEM と
+          Administrators はOS上もともと全ファイルへアクセス可能であり、
+          OWNER RIGHTS はファイル所有者に、Logon SID は実行中のログオン
+          セッションにのみ作用する。所有者が実行ユーザーまたは Administrators
+          であることも併せて検証し、一般の他ユーザーへの露出が無いことを保証する。
           （`parent_inheritable=False` は既定 DACL が適用される状況を再現する。）
         """
         icacls = KeyManager._icacls_executable()
         key_dir = tmp_path / "vault"
         key_dir.mkdir()
         if not parent_inheritable:
-            account = KeyManager._current_windows_account(key_dir)
             subprocess.run(
-                [icacls, str(key_dir), "/inheritance:r", "/grant:r", f"{account}:(F)"],
+                [
+                    icacls,
+                    str(key_dir),
+                    "/inheritance:r",
+                    "/grant:r",
+                    f"*{key_manager_module._current_user_sid()}:(F)",
+                ],
                 check=True,
                 capture_output=True,
             )
@@ -941,13 +935,7 @@ class TestSetPrivatePermissionsWindows:
             capture_output=True,
         )
         sddl = saved_acl.read_bytes().decode("utf-16-le").splitlines()[1]
-        whoami = subprocess.run(
-            [str(Path(icacls).with_name("whoami.exe")), "/user", "/fo", "csv", "/nh"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        user_sid = whoami.stdout.strip().split(",")[-1].strip('"')
+        user_sid = _whoami_user_sid()
 
         assert sddl.startswith("D:P"), sddl
         aces = [ace.split(";") for ace in re.findall(r"\(([^)]*)\)", sddl)]
@@ -957,15 +945,218 @@ class TestSetPrivatePermissionsWindows:
         administrators_sid = "S-1-5-32-544"
         # SYSTEM, Administrators, OWNER RIGHTS
         privileged_sids = {"S-1-5-18", administrators_sid, "S-1-3-4"}
+        logon_sid = re.compile(r"S-1-5-5-\d+-\d+")
         user_aces = [
-            [*ace[:5], _normalize_sddl_sid(ace[5])]
+            [*ace[:5], sid]
             for ace in aces
-            if _normalize_sddl_sid(ace[5]) not in privileged_sids
+            if (sid := _normalize_sddl_sid(ace[5])) not in privileged_sids
+            and not logon_sid.fullmatch(sid)
         ]
         # 0x13019f = 読み取り(0x120089) | 書き込み(0x100116) | 削除(0x10000)
         assert user_aces == [["A", "", "0x13019f", "", "", user_sid]], sddl
         assert _file_owner_sid(target) in {user_sid, administrators_sid}
         assert len(key_manager.load_key(target)) == 32
+
+
+class _FakeWin32:
+    """`advapi32` / `kernel32` の偽実装。
+
+    Windows 以外でも Win32 API 呼び出し経路（成功・各失敗・解放処理）を
+    検証できるよう、ctypes の出力引数（`byref`）へ実際に値を書き込む。
+    関数は属性（`argtypes` / `restype`）を設定できる通常の関数として提供する。
+    """
+
+    TOKEN_HANDLE = 0xBEEF
+    SID_POINTER = 0x5151
+
+    def __init__(
+        self,
+        *,
+        open_token: bool = True,
+        token_user_size: int = 44,
+        token_information: bool = True,
+        convert_sid: bool = True,
+        system_directory: str = r"C:\Windows\System32",
+        system_directory_length: int | None = None,
+    ) -> None:
+        self.closed_handles: list[int | None] = []
+        self.freed_pointers: list[int | None] = []
+        self.requested_access: list[int] = []
+        self.converted_sids: list[int] = []
+        self._keep_alive: list[ctypes.Array[ctypes.c_wchar]] = []
+
+        def open_process_token(process: object, access: int, token: Any) -> int:
+            self.requested_access.append(access)
+            if not open_token:
+                return 0
+            token._obj.value = self.TOKEN_HANDLE
+            return 1
+
+        def get_token_information(
+            token: object, info_class: int, buffer: Any, length: int, size: Any
+        ) -> int:
+            assert info_class == 1  # TokenUser
+            if buffer is None:
+                size._obj.value = token_user_size
+                return 0
+            if not token_information:
+                return 0
+            ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0] = self.SID_POINTER
+            return 1
+
+        def convert_sid_to_string_sid(sid: int, string_sid: Any) -> int:
+            self.converted_sids.append(sid)
+            if not convert_sid:
+                return 0
+            text = ctypes.create_unicode_buffer(_FAKE_USER_SID)
+            self._keep_alive.append(text)
+            string_sid._obj.value = ctypes.addressof(text)
+            return 1
+
+        def get_current_process() -> int:
+            return -1
+
+        def close_handle(handle: ctypes.c_void_p) -> int:
+            self.closed_handles.append(handle.value)
+            return 1
+
+        def local_free(pointer: ctypes.c_void_p) -> None:
+            self.freed_pointers.append(pointer.value)
+
+        def get_system_directory(buffer: Any, size: int) -> int:
+            buffer.value = system_directory
+            if system_directory_length is not None:
+                return system_directory_length
+            return len(system_directory)
+
+        self.advapi32 = SimpleNamespace(
+            OpenProcessToken=open_process_token,
+            GetTokenInformation=get_token_information,
+            ConvertSidToStringSidW=convert_sid_to_string_sid,
+        )
+        self.kernel32 = SimpleNamespace(
+            GetCurrentProcess=get_current_process,
+            CloseHandle=close_handle,
+            LocalFree=local_free,
+            GetSystemDirectoryW=get_system_directory,
+        )
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`_load_windows_library` を本偽実装へ差し替える。"""
+        libraries = {"advapi32": self.advapi32, "kernel32": self.kernel32}
+        monkeypatch.setattr(
+            key_manager_module, "_load_windows_library", libraries.__getitem__
+        )
+
+
+class TestWin32Helpers:
+    """Win32 API（ctypes）によるユーザー SID / System32 取得ヘルパーのテスト。"""
+
+    def test_load_windows_library_fails_without_windll(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ctypes.WinDLL が無い環境では OSError になることを確認する。"""
+        monkeypatch.delattr(ctypes, "WinDLL", raising=False)
+        with pytest.raises(OSError):
+            key_manager_module._load_windows_library("advapi32")
+
+    def test_load_windows_library_uses_windll_with_last_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ctypes.WinDLL を use_last_error=True で呼び出すことを確認する。"""
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def _fake_windll(name: str, **kwargs: object) -> str:
+            calls.append((name, kwargs))
+            return f"<{name}>"
+
+        monkeypatch.setattr(ctypes, "WinDLL", _fake_windll, raising=False)
+
+        assert key_manager_module._load_windows_library("kernel32") == "<kernel32>"
+        assert calls == [("kernel32", {"use_last_error": True})]
+
+    def test_system_directory_is_returned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GetSystemDirectoryW の結果をそのまま返し、icacls.exe の絶対パスを構成することを確認する。"""
+        _FakeWin32(system_directory=r"D:\OS\System32").install(monkeypatch)
+
+        assert key_manager_module._windows_system_directory() == r"D:\OS\System32"
+        assert KeyManager._icacls_executable() == str(
+            Path(r"D:\OS\System32") / "icacls.exe"
+        )
+
+    @pytest.mark.parametrize("length", [0, 32768])
+    def test_system_directory_failure_raises_os_error(
+        self, monkeypatch: pytest.MonkeyPatch, length: int
+    ) -> None:
+        """GetSystemDirectoryW が失敗（0）またはバッファ不足を返した場合に OSError になることを確認する。"""
+        _FakeWin32(system_directory_length=length).install(monkeypatch)
+        with pytest.raises(OSError):
+            key_manager_module._windows_system_directory()
+
+    def test_current_user_sid_reads_token_user_and_releases_resources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TokenUser の SID を文字列化して返し、ハンドルと文字列領域を解放することを確認する。"""
+        fake = _FakeWin32()
+        fake.install(monkeypatch)
+
+        assert key_manager_module._current_user_sid() == _FAKE_USER_SID
+        assert fake.requested_access == [0x0008]  # TOKEN_QUERY
+        assert fake.converted_sids == [_FakeWin32.SID_POINTER]
+        assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
+        assert len(fake.freed_pointers) == 1
+        assert fake.freed_pointers[0] is not None
+
+    def test_open_process_token_failure_raises_without_closing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenProcessToken が失敗した場合、OSError となり未取得のハンドルを閉じないことを確認する。"""
+        fake = _FakeWin32(open_token=False)
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._current_user_sid()
+        assert fake.closed_handles == []
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"token_user_size": 0},
+            {"token_information": False},
+            {"convert_sid": False},
+        ],
+        ids=["size-query", "token-information", "convert-sid"],
+    )
+    def test_token_query_failures_raise_and_close_handle(
+        self, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+    ) -> None:
+        """トークン情報の取得・SID 変換の失敗時も OSError となり、トークンハンドルを閉じることを確認する。"""
+        fake = _FakeWin32(**options)
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._current_user_sid()
+        assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
+        assert fake.freed_pointers == []
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
+    )
+    def test_real_current_user_sid_matches_whoami(self) -> None:
+        """実環境のプロセストークンから取得した SID が whoami の結果と一致することを確認する。"""
+        assert key_manager_module._current_user_sid() == _whoami_user_sid()
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
+    )
+    def test_real_icacls_executable_exists_in_system_directory(self) -> None:
+        """実環境で解決した icacls.exe が System32 に実在することを確認する。"""
+        icacls = Path(KeyManager._icacls_executable())
+        assert icacls.name.lower() == "icacls.exe"
+        assert icacls.is_file()
+        assert icacls.parent == Path(key_manager_module._windows_system_directory())
 
 
 class TestSafeAtomicWrite:
