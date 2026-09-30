@@ -127,7 +127,7 @@ JSON全体を暗号化し、ファイルにはメタデータと暗号文だけ�
 ```text
 - Python標準ライブラリで追加依存が不要
 - Windows / Linux / macOSで動作差が少ない
-- -g、-k、--secret、--forceなどを明確に定義できる
+- -g、-k、--stdin、--forceなどを明確に定義できる
 - サブコマンドとエイリアスを細かく制御できる
 - vtotp <service> の独自フォールバック処理を実装しやすい
 - CLIの挙動を予測しやすい
@@ -634,6 +634,10 @@ class CliHandler:
         """正規化後の引数を解析する"""
         ...
 
+    def reject_deprecated_secret_args(self, argv: list[str]) -> None:
+        """addの廃止済みシークレット引数を安全に検知する"""
+        ...
+
     def dispatch(self, command: ParsedCommand) -> int:
         """解析済みコマンドをユースケースへ委譲する"""
         ...
@@ -642,6 +646,13 @@ class CliHandler:
         """安全なエラー表示と終了コード変換"""
         ...
 ```
+
+`run()` は引数を正規化した後、実行されたサブコマンドや引数位置（前置・後置）に
+関わらず、CLI引数列全体（`argv`）を `argparse` に渡す前に
+`reject_deprecated_secret_args()` で事前検査する。`--secret` / `-s` が指定されていたら、
+引数列や該当値を表示・ログ出力・例外コンテキストへ複製せず、固定の
+`SECRET_ARG_DEPRECATED` を持つ `CommandParseError` に変換する。これにより、
+`argparse` 標準の `unrecognized arguments: ...` が秘密値をエコーバックする経路を遮断する。
 
 ## 12. CLIコマンド定義
 
@@ -652,8 +663,7 @@ vtotp generate SERVICE [--key PATH] [--storage PATH]
 vtotp get SERVICE [--key PATH] [--storage PATH]
 vtotp -g SERVICE [--key PATH] [--storage PATH]
 
-vtotp add SERVICE [--secret SECRET] [--issuer ISSUER]
-                  [--key PATH] [--storage PATH]
+vtotp add SERVICE [--issuer ISSUER] [--stdin] [--key PATH] [--storage PATH]
 
 vtotp remove SERVICE [--force]
                     [--key PATH] [--storage PATH]
@@ -877,10 +887,17 @@ CliHandler
 
 ```text
 CliHandler
+    -> --stdin未指定時: 標準入力のTTY判定（鍵・ストレージへのアクセス前）
+         非TTY: STDIN_OPTION_REQUIREDで終了コード2、以降のファイルアクセスを行わず終了
+         TTY: 続行
+    -> --stdin指定時: TTY判定をスキップして続行
     -> ConfigManager
     -> KeyManager.load_key()
     -> SecureStorage.load()
-    -> SecretInputReader.read_secret()
+    -> シークレット入力経路の判定
+         --stdin指定時: SecretInputReader.read_secret()
+             標準入力をUTF-8として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾のCR/LF改行を除去する（マスキングなし）
+         --stdin未指定時（TTY確認済み）: SecretInputReader.read_secret()でマスキング入力し、空入力時はキャンセルする
     -> TotpGenerator.validate_secret()
     -> ServiceRegistry.add_or_update()
     -> SecureStorage.save()
@@ -1004,8 +1021,7 @@ CliHandler
 
 - 秘密情報を例外メッセージ、デバッグログ、argparseのusage表示へ混入させない。
 
-- --secretで渡した値はOSのプロセス一覧やシェル履歴に残る可能性があるため、
-  未指定時の対話入力を推奨する。
+- コマンドライン引数による平文シークレットの直接受け渡しは全面的に廃止・禁止し、シェル履歴、OSのプロセス一覧、プロセス監査ログへの露出を根本排除する。
 
 - 暗号化ファイルには認証付き暗号を使用する。
 
@@ -1242,13 +1258,23 @@ class MsgKey(StrEnum):
     SERVICE_NOT_FOUND = "service_not_found"
     INVALID_SECRET = "invalid_secret"
     COMMAND_PARSE_ERROR = "command_parse_error"
+    SECRET_ARG_DEPRECATED = "secret_arg_deprecated"
+    STDIN_OPTION_REQUIRED = "stdin_option_required"
     CONFIG_SUMMARY = "config_summary"
     CONFIG_LANGUAGE_UPDATED = "config_language_updated"
 
 
 Catalog = Mapping[MsgKey, str]
-EN_CATALOG: Catalog = {...}
-JA_CATALOG: Catalog = {...}
+EN_CATALOG: Catalog = {
+    # 他のメッセージキーは省略
+    MsgKey.SECRET_ARG_DEPRECATED: "The --secret/-s option has been removed for security. Use interactive prompt or --stdin.",
+    MsgKey.STDIN_OPTION_REQUIRED: "Standard input is not a terminal. Use --stdin to pass secrets via pipe or redirect.",
+}
+JA_CATALOG: Catalog = {
+    # 他のメッセージキーは省略
+    MsgKey.SECRET_ARG_DEPRECATED: "--secret/-s オプションはセキュリティのため廃止されました。対話入力または --stdin を使用してください。",
+    MsgKey.STDIN_OPTION_REQUIRED: "標準入力がターミナルではありません。パイプやリダイレクトでシークレットを渡す場合は --stdin を指定してください。",
+}
 SUPPORTED_LANGUAGES = ("en", "ja")
 ```
 
@@ -1312,7 +1338,7 @@ vtotp <command-or-service> [SERVICE] [options...]
 vtotp init [--key PATH] [--lang en|ja]
 vtotp generate SERVICE [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp get SERVICE [--key PATH] [--storage PATH] [--lang en|ja]
-vtotp add SERVICE [--secret SECRET] [--issuer ISSUER] [--key PATH] [--storage PATH] [--lang en|ja]
+vtotp add SERVICE [--issuer ISSUER] [--stdin] [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp remove SERVICE [--force] [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp list [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp rekey [--key PATH] [--storage PATH] [--lang en|ja]
@@ -1323,6 +1349,28 @@ vtotp config set language en|ja [--lang en|ja]
 `-g`、`rm`、`ls` はそれぞれ既存の別名として同じ契約へ正規化する。`config -l/--lang`
 は `config set language` と同等に `language` を保存する。設定更新時の表示言語も、
 指定された新言語を使用する。
+
+### 20.3 廃止シークレット引数の安全な拒否
+
+CLI引数列全体（`argv`）を `argparse` の解析前に事前走査し、実行されるコマンド名や
+引数の指定位置（前置・後置）に関わらず、廃止済みの `--secret`、`-s` および
+値を同一トークンに結合した形式・省略形式（`--secret=VALUE`、`-sVALUE`、`--sec`等）を検知する。検知時は
+`argparse` に引数を渡さず、`CommandParseError`（終了コード2、メッセージキー
+`SECRET_ARG_DEPRECATED`、空のコンテキスト）で直ちに終了する。表示は翻訳済みの固定メッセージ
+だけとし、入力された引数列、値、`argparse` の標準エラー文を含めない。これにより、
+`unrecognized arguments: ...` によるシークレット値のエコーバックを防ぐ。
+
+### 20.4 非TTY環境での `--stdin` 必須化
+
+`add` で `--stdin` が指定されていない場合、シークレットの対話入力へ進む前に標準入力の
+TTY状態を確認する。この判定は鍵ファイルや暗号化ストレージを読み込む前に行い、標準入力が
+TTYでない（パイプ、リダイレクト、またはTTY判定を提供しない入力ストリーム）場合は、
+鍵ファイルや暗号化ストレージの不在・破損等の状態に関わらず、`STDIN_OPTION_REQUIRED` を持つ
+`CommandParseError`（終了コード2、空のコンテキスト）を送出してプロンプトを表示せず即座に
+終了する。TTYの場合のみ、
+マスキング付きの対話入力を行う。`--stdin` 指定時はこのTTY判定を行わず、標準入力をUTF-8
+として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾CR/LF改行を除去した値を
+Base32形式の検証へ渡す。
 
 ## 21. ドメイン例外と表示層の連携
 
@@ -1344,6 +1392,10 @@ raise KeyNotFoundError(context={"path": display_path})
 を維持して `stderr` へ出力する。`str(error)`、traceback、低レベル例外の生メッセージを
 ユーザー出力へ流さない。これにより、core/domain層は言語に依存せず、表示層だけが
 ローカライズ責務を持つ。
+
+廃止された `--secret` / `-s` の検知には、新たな例外型を設けず `CommandParseError` を使う。
+この場合は終了コード `2`、メッセージキー `SECRET_ARG_DEPRECATED`、秘密値や生引数を含まない
+空のコンテキストを設定する。表示層はカタログの固定文だけを出力する。
 
 ## 22. PEメタデータとリリースCI
 

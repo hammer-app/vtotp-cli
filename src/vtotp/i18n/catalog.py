@@ -50,6 +50,8 @@ class MsgKey(StrEnum):
 
     COMMAND_PARSE_ERROR = "command_parse_error"
     SERVICE_MUST_PRECEDE_OPTIONS = "service_must_precede_options"
+    SECRET_ARG_DEPRECATED = "secret_arg_deprecated"
+    STDIN_OPTION_REQUIRED = "stdin_option_required"
     PATH_EMPTY = "path_empty"
     PATH_UNCLOSED_QUOTE = "path_unclosed_quote"
 
@@ -136,6 +138,14 @@ EN_CATALOG: Catalog = {
     MsgKey.COMMAND_PARSE_ERROR: "Argument error: {detail}",
     MsgKey.SERVICE_MUST_PRECEDE_OPTIONS: (
         "SERVICE must immediately follow the command, before any options"
+    ),
+    MsgKey.SECRET_ARG_DEPRECATED: (
+        "The --secret/-s option has been removed for security. "
+        "Use interactive prompt or --stdin."
+    ),
+    MsgKey.STDIN_OPTION_REQUIRED: (
+        "Standard input is not a terminal. "
+        "Use --stdin to pass secrets via pipe or redirect."
     ),
     MsgKey.PATH_EMPTY: "Path cannot be empty",
     MsgKey.PATH_UNCLOSED_QUOTE: "Quotes are not properly closed: {value}",
@@ -224,6 +234,14 @@ JA_CATALOG: Catalog = {
     MsgKey.COMMAND_PARSE_ERROR: "引数エラー: {detail}",
     MsgKey.SERVICE_MUST_PRECEDE_OPTIONS: (
         "SERVICEはサブコマンドの直後に指定してください（オプションより前）"
+    ),
+    MsgKey.SECRET_ARG_DEPRECATED: (
+        "--secret/-s オプションはセキュリティのため廃止されました。"
+        "対話入力または --stdin を使用してください。"
+    ),
+    MsgKey.STDIN_OPTION_REQUIRED: (
+        "標準入力がターミナルではありません。"
+        "パイプやリダイレクトでシークレットを渡す場合は --stdin を指定してください。"
     ),
     MsgKey.PATH_EMPTY: "パスを空にすることはできません",
     MsgKey.PATH_UNCLOSED_QUOTE: "引用符が正しく閉じられていません: {value}",

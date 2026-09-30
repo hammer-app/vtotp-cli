@@ -112,15 +112,26 @@ vtotp init -k "D:\USB\master.key" -l en
 
 ### 2. サービスの登録 (`add`)
 
-Base32 形式の TOTP シークレットを登録します。シークレットは `--secret`（短縮形: `-s`）で直接指定できます。
+Base32 形式の TOTP シークレットを登録します。
+
+手動実行時は、ターミナル履歴に残らない安全な「対話入力（マスキング入力）」を推奨します。スクリプトやパイプラインからの自動登録には、`--stdin` オプションによる標準入力経由の受け渡しに対応しています。
+
+<!-- Note -->
+> **Note**: コマンドライン引数（`--secret` / `-s`）による直接指定は、シェル履歴（`.bash_history`、PowerShell Readline 履歴）やプロセスコマンドライン（`ps`, `Get-Process`）に平文シークレットが残存する重大なリスクがあるため、セキュリティ上の理由から完全に廃止されました。
+<!-- Warning -->
+> **Warning (シェル履歴への配慮)**: 対話ターミナルで `echo "シークレット" | vtotp add ... --stdin` のように直接シークレット文字列をパイプすると、シェルのコマンド履歴に平文が残ってしまいます。標準入力連携を利用する際は、シークレットを記載した一時ファイル（登録後速やかに破棄）やパスワードマネージャーやセキュアなシークレットストア等からのパイプを使用してください。
 
 ```powershell
-# 対話プロンプトで安全に入力する場合（推奨: ターミナル履歴に残りません）
+# 対話入力で安全に登録（推奨: マスキング入力のためターミナル履歴に残りません）
 vtotp add github
+vtotp add aws --issuer Amazon
 
-# 引数で直接指定する場合（--secret / -s）
-vtotp add aws --secret JBSWY3DPEHPK3PXP --issuer Amazon
-vtotp add aws -s JBSWY3DPEHPK3PXP --issuer Amazon
+# 標準入力パイプ渡しによる登録（PowerShell: 一時ファイル等からパイプ渡し）
+Get-Content secret.txt | vtotp add aws --stdin
+Get-Content secret.txt | vtotp add aws --issuer Amazon --stdin
+
+# （参考）Linux / macOS でのファイルパイプ渡し
+# cat secret.txt | vtotp add aws --stdin
 ```
 
 ### 3. TOTP コードの生成 (`generate`、エイリアス: `get` / `-g`、省略形)
@@ -188,10 +199,12 @@ vtotp のコマンドラインは、パイプ連携やスクリプト組み込�
 # 正しい例（SERVICEがサブコマンド直後、オプションは後方・順不同）
 vtotp get github -l ja
 vtotp get github --key "PATH" -l ja
+vtotp add aws --stdin -l ja
 
 # 非サポート（終了コード 2 で拒否される）
 vtotp get -l ja github
 vtotp get --key "PATH" github
+vtotp add --stdin aws
 ```
 
 ---
