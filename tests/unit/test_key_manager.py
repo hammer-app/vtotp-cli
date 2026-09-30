@@ -631,6 +631,20 @@ def _win32_security_apis() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi32.OpenProcessToken.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     return advapi32, kernel32
 
@@ -681,6 +695,65 @@ def _file_owner_sid(path: Path) -> str:
         return _sid_to_string(owner)
     finally:
         kernel32.LocalFree(descriptor)
+
+
+class _SidAndAttributes(ctypes.Structure):
+    """Win32 の `SID_AND_ATTRIBUTES` 構造体。"""
+
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_uint32)]
+
+
+class _TokenGroups(ctypes.Structure):
+    """Win32 の `TOKEN_GROUPS` 構造体（`Groups` は可変長配列の先頭要素）。"""
+
+    _fields_ = [("GroupCount", ctypes.c_uint32), ("Groups", _SidAndAttributes * 1)]
+
+
+def _current_logon_sids() -> set[str]:
+    """現在のプロセストークンのグループから、ログオンセッション SID を返す（Windows 専用）。
+
+    `GetTokenInformation(TokenGroups)` で取得した `TOKEN_GROUPS` のうち、
+    属性に `SE_GROUP_LOGON_ID` を持つエントリを抽出する。抽出した SID が
+    Logon SID の形式（`S-1-5-5-X-Y`）であることも併せて検証する。
+    """
+    token_query, token_groups_class = 0x0008, 2
+    se_group_logon_id = 0xC0000000
+    advapi32, kernel32 = _win32_security_apis()
+
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        required_size = ctypes.c_uint32(0)
+        advapi32.GetTokenInformation(
+            token, token_groups_class, None, 0, ctypes.byref(required_size)
+        )
+        buffer = ctypes.create_string_buffer(required_size.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            token_groups_class,
+            buffer,
+            required_size.value,
+            ctypes.byref(required_size),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(token)
+
+    header = _TokenGroups.from_buffer(buffer)
+    groups = ctypes.cast(
+        ctypes.addressof(buffer) + _TokenGroups.Groups.offset,
+        ctypes.POINTER(_SidAndAttributes),
+    )
+    logon_sids = {
+        _sid_to_string(ctypes.c_void_p(groups[index].Sid))
+        for index in range(header.GroupCount)
+        if groups[index].Attributes & se_group_logon_id == se_group_logon_id
+    }
+    assert all(re.fullmatch(r"S-1-5-5-\d+-\d+", sid) for sid in logon_sids), logon_sids
+    return logon_sids
 
 
 def _raise_os_error(*args: object, **kwargs: object) -> None:
@@ -903,7 +976,8 @@ class TestSetPrivatePermissionsWindows:
         - それ以外に残り得るのは、親に継承可能 ACE が無い場合などにトークンの
           既定 DACL 等から明示 ACE として付与される SYSTEM / Administrators /
           OWNER RIGHTS、および現在のログオンセッションを表す Logon SID
-          （`S-1-5-5-X-Y`）のみ（REQUIREMENTS.md 4.1 の注記）。SYSTEM と
+          （プロセストークンの `TokenGroups` から取得した SID と完全一致する
+          もの）のみ（REQUIREMENTS.md 4.1 の注記）。SYSTEM と
           Administrators はOS上もともと全ファイルへアクセス可能であり、
           OWNER RIGHTS はファイル所有者に、Logon SID は実行中のログオン
           セッションにのみ作用する。所有者が実行ユーザーまたは Administrators
@@ -943,14 +1017,14 @@ class TestSetPrivatePermissionsWindows:
         # SDDL は既知の SID を別名（SY, BA, 組み込み Administrator の LA 等）で
         # 表記するため、完全な SID 文字列へ正規化してから比較する。
         administrators_sid = "S-1-5-32-544"
-        # SYSTEM, Administrators, OWNER RIGHTS
-        privileged_sids = {"S-1-5-18", administrators_sid, "S-1-3-4"}
-        logon_sid = re.compile(r"S-1-5-5-\d+-\d+")
+        # SYSTEM, Administrators, OWNER RIGHTS と、現在のセッションの Logon SID のみを
+        # 許容する（他セッションの Logon SID は許容対象外として user_aces に残る）。
+        allowed_sids = {"S-1-5-18", administrators_sid, "S-1-3-4"}
+        allowed_sids |= _current_logon_sids()
         user_aces = [
             [*ace[:5], sid]
             for ace in aces
-            if (sid := _normalize_sddl_sid(ace[5])) not in privileged_sids
-            and not logon_sid.fullmatch(sid)
+            if (sid := _normalize_sddl_sid(ace[5])) not in allowed_sids
         ]
         # 0x13019f = 読み取り(0x120089) | 書き込み(0x100116) | 削除(0x10000)
         assert user_aces == [["A", "", "0x13019f", "", "", user_sid]], sddl
@@ -1147,6 +1221,24 @@ class TestWin32Helpers:
     def test_real_current_user_sid_matches_whoami(self) -> None:
         """実環境のプロセストークンから取得した SID が whoami の結果と一致することを確認する。"""
         assert key_manager_module._current_user_sid() == _whoami_user_sid()
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
+    )
+    def test_real_logon_sids_match_whoami_logonid(self) -> None:
+        """TokenGroups から抽出したログオンセッション SID が whoami /logonid の結果と一致することを確認する。
+
+        `whoami /groups` は Logon SID を列挙しないため、SID のみを出力する
+        `whoami /logonid` を独立した照合元として用いる。
+        """
+        whoami = Path(key_manager_module._windows_system_directory()) / "whoami.exe"
+        result = subprocess.run(
+            [str(whoami), "/logonid"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert _current_logon_sids() == {result.stdout.strip()}
 
     @pytest.mark.skipif(
         not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
