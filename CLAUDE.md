@@ -1,7 +1,7 @@
 # Project Guidelines: vtotp
 
 Custom CLI TOTP Authenticator built in Python.
-Refer to @docs/REQUIREMENTS.md for functional requirements and @docs/DESIGN.md for detailed architectural design specs.
+Refer to `docs/REQUIREMENTS.md` for functional requirements and `docs/DESIGN.md` for detailed architectural design specs.
 
 ## Operational Rules & Behavioral Guidelines
 
