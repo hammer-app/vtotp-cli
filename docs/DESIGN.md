@@ -389,6 +389,8 @@ ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace 
     `advapi32.dll` の Win32 API を呼び出して DACL を検査する。`GetNamedSecurityInfoW`
     で `DACL_SECURITY_INFORMATION` を指定して DACL を取得し、`GetAce` で各 ACE を
     走査し、ACE の SID を `ConvertSidToStringSidW` で文字列化して許可リストと照合する。
+    現在のセッションの Logon SID は `GetTokenInformation(TokenGroups)` で取得した
+    グループ SID のうち `SE_GROUP_LOGON_ID` 属性を持つ SID から特定する。
     これらの Win32 API 呼び出しが失敗した場合も検証不能とみなし、`KeyStorageError`
     で処理を中断する。
 - **許可 ACE ホワイトリスト:**
@@ -397,12 +399,26 @@ ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace 
   - `NT AUTHORITY\SYSTEM`（`S-1-5-18`）
   - `BUILTIN\Administrators`（`S-1-5-32-544`）
   - `OWNER RIGHTS`（`S-1-3-4`）
-  - ログオンセッション SID（`S-1-5-5-` プレフィックスを持つ SID）
+  - 現在のログオンセッション SID（プロセストークンの `TokenGroups` から取得した、
+    現在のプロセスに紐づく Logon SID）
 - **検証ルール:** 上記許可リストに含まれないアカウントに対する明示的な許可 ACE
     （`ACCESS_ALLOWED_ACE`）が 1 つでも存在する場合は、即座に `KeyStorageError`
     （終了コード 1）を送出し、一時ファイルを安全に削除して処理を中断する。既存の
-    正式な鍵ファイルは変更しない。拒否 ACE（`ACCESS_DENIED_ACE`）はアクセス許可を
-    与えるものではないため、本検証の対象外とする。
+    正式な鍵ファイルは変更しない。
+
+  検証はフェイルクローズ（安全側に倒す）とし、次の場合はすべて検証不能として
+  拒否する。
+
+  - **NULL DACL の拒否:** セキュリティ記述子が DACL を保持しない（NULL DACL）
+    場合は、全ユーザーにフルアクセスを許可する状態と同等であり検証不能であるため、
+    `KeyStorageError` を送出して処理を中断する。
+  - **未解釈 ACE 種別の拒否:** SID のオフセットを安全に解釈できない ACE 種別
+    （`ACCESS_ALLOWED_OBJECT_ACE` 等の OBJECT 形式を含む、本仕様で列挙しない
+    許可 ACE 種別）が 1 つでも含まれる場合は、許可対象を確定できないため検証不能
+    として `KeyStorageError` を送出して処理を中断する。
+  - **拒否 ACE のスキップ:** 拒否 ACE（`ACCESS_DENIED_ACE`、OBJECT・CALLBACK・
+    CALLBACK_OBJECT 形式を含むすべての拒否 ACE）はアクセス権を付与しないため、
+    本検証の対象外としスキップする。
 
 再検証で送出する例外メッセージやログにも、鍵の内容を含めない。
 
