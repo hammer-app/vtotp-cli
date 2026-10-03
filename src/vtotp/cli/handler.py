@@ -10,6 +10,7 @@ TOTPシークレットや鍵の内容はいかなる場合もstdout/stderrへ出
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ from vtotp.core.totp_generator import TotpGenerator
 from vtotp.domain.exceptions import (
     CancelledError,
     CommandParseError,
+    InvalidSecretError,
     KeyNotFoundError,
     TotpCliError,
 )
@@ -50,6 +52,43 @@ _LANG_CHOICES: list[str] = list(SUPPORTED_LANGUAGES)
 
 #: パスの前後引用符として認識する文字。
 _QUOTE_CHARS = "\"'"
+
+#: `add --stdin` で読み込んだシークレットの末尾から除去する改行文字。
+_TRAILING_NEWLINE_CHARS = "\r\n"
+
+#: `add --stdin` で読み込んだシークレットの先頭から除去するBOM（U+FEFF）。
+_BOM_CHAR = "﻿"
+
+#: 廃止済みのシークレット引数（長形式・短形式）。
+_DEPRECATED_SECRET_LONG_OPTION = "--secret"
+_DEPRECATED_SECRET_SHORT_OPTION = "-s"
+
+#: argparseの前方一致（`--sec`等）で`--secret`の省略形とみなす最短の長さ。
+#: `--s`は現行の`--stdin`/`--storage`とも共通する接頭辞のため対象外とする。
+_DEPRECATED_SECRET_MIN_PREFIX_LENGTH = len("--se")
+
+
+def _is_deprecated_secret_arg(token: str) -> bool:
+    """`token`が廃止済みの`--secret`/`-s`（値の結合形式・省略形を含む）かを判定する。
+
+    対象は `--secret`、`--secret=VALUE`、`--sec` 等の前方一致省略形、
+    および `-s`、`-sVALUE` である。
+    """
+    if token.startswith("--"):
+        option_name = token.split("=", 1)[0]
+        if len(option_name) < _DEPRECATED_SECRET_MIN_PREFIX_LENGTH:
+            return False
+        return _DEPRECATED_SECRET_LONG_OPTION.startswith(option_name)
+    return token.startswith(_DEPRECATED_SECRET_SHORT_OPTION)
+
+
+def _read_masked_input() -> str:
+    """入力内容をエコーせずに（マスキングして）1行を読み込む。
+
+    プロンプト文言は呼び出し元がstderrへ表示するため、`getpass`自体には
+    空のプロンプトを渡す。
+    """
+    return getpass.getpass(prompt="")
 
 
 def _strip_quotes(value: str, language: str) -> str:
@@ -158,13 +197,16 @@ class CliHandler:
         stderr: IO[str] | None = None,
         input_func: Callable[[], str] | None = None,
         config_path: Path | None = None,
+        stdin: IO[str] | None = None,
+        secret_input_func: Callable[[], str] | None = None,
     ) -> None:
         """依存コンポーネントと入出力ストリームを設定する。
 
         いずれの引数も省略可能で、省略時は実運用向けの既定値（実際の
-        コアコンポーネント、``sys.stdout``/``sys.stderr``、組み込みの
-        ``input``、既定のconfig.jsonパス）が使用される。テストからは
-        これらを注入してふるまいを検証できる。
+        コアコンポーネント、``sys.stdin``/``sys.stdout``/``sys.stderr``、
+        組み込みの ``input``、マスキング入力（``getpass``）、既定の
+        config.jsonパス）が使用される。テストからはこれらを注入して
+        ふるまいを検証できる。
         """
         self._key_manager = key_manager if key_manager is not None else KeyManager()
         self._secure_storage = (
@@ -178,7 +220,11 @@ class CliHandler:
         )
         self._stdout: IO[str] = stdout if stdout is not None else sys.stdout
         self._stderr: IO[str] = stderr if stderr is not None else sys.stderr
+        self._stdin: IO[str] = stdin if stdin is not None else sys.stdin
         self._input: Callable[[], str] = input_func if input_func is not None else input
+        self._secret_input: Callable[[], str] = (
+            secret_input_func if secret_input_func is not None else _read_masked_input
+        )
         self._config_path = (
             config_path if config_path is not None else DEFAULT_CONFIG_PATH
         )
@@ -224,6 +270,7 @@ class CliHandler:
         )
 
         try:
+            self.reject_deprecated_secret_args(normalized_argv)
             self._validate_service_position(normalized_argv)
             parsed_args = self._parser.parse_args(normalized_argv)
         except SystemExit as exc:
@@ -276,6 +323,26 @@ class CliHandler:
         if first in self.RESERVED_COMMANDS or first.startswith("-"):
             return list(argv)
         return ["generate", first, *argv[1:]]
+
+    def reject_deprecated_secret_args(self, argv: Sequence[str]) -> None:
+        """引数列のどこかに廃止済みの `--secret`/`-s` が含まれていれば拒否する。
+
+        argparseへ渡すと、未知の引数として `unrecognized arguments: --secret
+        VALUE` のようにシークレット値をstderrへエコーバックしてしまうため、
+        解析より前に検知し、固定メッセージの :class:`CommandParseError`
+        （終了コード2）へ変換する。引数列や値は例外コンテキストへ一切含め
+        ない（DESIGN.md 20.3、Zero Leakage Rule）。
+
+        サブコマンドより前（`vtotp --secret VALUE add github`）、`add`以外の
+        コマンドや省略形（`vtotp github --secret VALUE`）、`--` 以降も
+        argparseは同様にエコーバックするため、位置・コマンドを問わず全トークンを
+        検査対象とする。SERVICEの位置検証より優先してこのメッセージで拒否する。
+        いずれのサブコマンドにも `-s` で始まる短形式オプションや `--se` で
+        始まる長形式オプションは存在せず、`-` で始まる値はargparse自体が
+        オプションとみなして値として受理しないため、正規の引数を誤検知しない。
+        """
+        if any(_is_deprecated_secret_arg(token) for token in argv):
+            raise CommandParseError(MsgKey.SECRET_ARG_DEPRECATED, context={})
 
     def _validate_service_position(self, argv: Sequence[str]) -> None:
         """`SERVICE` を必須とするコマンドで、サブコマンド直後に `SERVICE` が
@@ -351,8 +418,12 @@ class CliHandler:
 
         add_parser = subparsers.add_parser("add", help="Register a new service")
         add_parser.add_argument("service")
-        add_parser.add_argument("--secret", "-s", default=None)
+        # シークレットをCLI引数で受け取る`--secret`/`-s`は、シェル履歴・プロセス
+        # 一覧への露出を防ぐため廃止済み（REQUIREMENTS.md 3.4 / 4.1）。指定された
+        # 場合は、argparseへ渡す前に`reject_deprecated_secret_args`が値をエコー
+        # バックしない固定メッセージ（終了コード2）で拒否する。
         add_parser.add_argument("--issuer", default=None)
+        add_parser.add_argument("--stdin", action="store_true")
         add_parser.add_argument("-k", "--key", type=_type_path, default=None)
         add_parser.add_argument("--storage", type=_type_path, default=None)
         add_parser.add_argument("-l", "--lang", choices=_LANG_CHOICES, default=None)
@@ -551,17 +622,65 @@ class CliHandler:
         return normalized if normalized is not None else default_language
 
     def _prompt_for_secret(self) -> str | None:
-        """`add` で `--secret` 未指定時に、TOTPシークレットを対話入力で取得する。"""
+        """`add` で `--stdin` 未指定時に、TOTPシークレットをマスキング対話入力で取得する。
+
+        入力内容は画面にエコーしない。空欄・EOFの場合は ``None`` を返し、
+        呼び出し元でキャンセル扱いとする。
+        """
         print(
             formatter.format_message(MsgKey.ADD_PROMPT_SECRET, self._current_language),
             file=self._stderr,
         )
         try:
-            response = self._input()
+            response = self._secret_input()
         except EOFError:
             return None
         response = response.strip()
         return response if response else None
+
+    def _stdin_is_terminal(self) -> bool:
+        """標準入力が対話端末（TTY）かを判定する。
+
+        `isatty` を持たないストリーム（標準入力が存在しない実行環境等）は、
+        キーボード入力を待てないため非TTYとして扱う。
+        """
+        isatty = getattr(self._stdin, "isatty", None)
+        return callable(isatty) and bool(isatty())
+
+    def _read_stdin_text(self) -> str:
+        """標準入力全体を文字列として読み込む。
+
+        バイナリバッファを持つ実際の標準入力は、ロケール既定のエンコーディング
+        （日本語Windowsではcp932）ではなくUTF-8としてデコードする。これにより
+        Windows PowerShell 5.1がコードページ65001下でパイプ先へ付与するUTF-8 BOM
+        （`EF BB BF`）が `\\ufeff` として復元され、呼び出し元で除去できる。
+        Base32シークレットはASCIIのみで構成されるため、UTF-8でのデコードは
+        いずれのコードページから渡された正規の入力も変化させない。
+        """
+        buffer = getattr(self._stdin, "buffer", None)
+        if buffer is None:
+            return self._stdin.read()
+        data: bytes = buffer.read()
+        return data.decode("utf-8")
+
+    def _read_secret_from_stdin(self) -> str:
+        """`add --stdin` 指定時に、標準入力全体からTOTPシークレットを読み込む。
+
+        先頭のUTF-8 BOM（Windows PowerShell 5.1が多重に付与する場合を含む）を
+        すべて除去したうえで、末尾の改行（CR/LF）を除去して返す。パイプ連携
+        向けの経路であるため、空入力は対話入力のようなキャンセルではなく、
+        不正なシークレットとして :class:`InvalidSecretError` を送出する。
+        デコードできないバイト列が渡された場合も同様に扱い、入力内容は例外へ
+        含めない（Zero Leakage Rule）。
+        """
+        try:
+            raw = self._read_stdin_text()
+        except UnicodeDecodeError:
+            raise InvalidSecretError(MsgKey.SECRET_INVALID_FORMAT) from None
+        secret = raw.lstrip(_BOM_CHAR).rstrip(_TRAILING_NEWLINE_CHARS)
+        if not secret:
+            raise InvalidSecretError(MsgKey.SECRET_EMPTY)
+        return secret
 
     def _confirm_existing_key_warning(self, path: Path) -> bool:
         """`init` の第1警告：既存鍵ファイルの上書き確認。"""
@@ -647,14 +766,23 @@ class CliHandler:
 
     def _cmd_add(self, args: argparse.Namespace) -> int:
         """新しいサービスをシークレットとともに登録する。"""
+        # 非TTY（パイプ・リダイレクト・CI等）では、WindowsのgetpassがOSの
+        # コンソールを直接読みに行きパイプを無視して無期限に待機するため、
+        # `--stdin` の指定漏れとして即座に拒否する。鍵・ストレージの状態に
+        # 左右されず決定的に終了コード2となるよう、ファイルアクセスより前に行う。
+        if not args.stdin and not self._stdin_is_terminal():
+            raise CommandParseError(MsgKey.STDIN_OPTION_REQUIRED, context={})
+
         key_path = self._resolve_key_path(args.key)
         storage_path = self._resolve_storage_path(args.storage)
 
         key = self._key_manager.load_key(key_path)
         records = self._secure_storage.load_secrets(storage_path, key)
 
-        secret: str | None = args.secret
-        if secret is None:
+        secret: str | None
+        if args.stdin:
+            secret = self._read_secret_from_stdin()
+        else:
             secret = self._prompt_for_secret()
             if secret is None:
                 self._cancel()

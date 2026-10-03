@@ -23,6 +23,11 @@ def detect_os_locale() -> str | None:
 
     環境変数がいずれも設定されていない場合は、``locale`` モジュールを介して
     OSの既定ロケールを問い合わせる。検出に失敗した場合は ``None`` を返す。
+
+    問い合わせには ``LC_CTYPE`` カテゴリを用いる。``LC_ALL`` はPOSIX環境で
+    カテゴリごとに値が異なると複合文字列（``LC_CTYPE=C.UTF-8;LC_NUMERIC=C;...``）
+    となり、:func:`locale.getlocale` が ``TypeError`` を送出するため使用しない。
+    ``LC_MESSAGES`` はWindowsに存在しないため使用しない。
     """
     for variable in _LOCALE_ENV_VARIABLES:
         value = os.environ.get(variable)
@@ -30,13 +35,13 @@ def detect_os_locale() -> str | None:
             return value
 
     try:
-        previous = locale.setlocale(locale.LC_ALL)
+        previous = locale.setlocale(locale.LC_CTYPE)
         try:
-            locale.setlocale(locale.LC_ALL, "")
-            language_code, _encoding = locale.getlocale(locale.LC_ALL)
+            locale.setlocale(locale.LC_CTYPE, "")
+            language_code, _encoding = locale.getlocale(locale.LC_CTYPE)
         finally:
-            locale.setlocale(locale.LC_ALL, previous)
-    except locale.Error:
+            locale.setlocale(locale.LC_CTYPE, previous)
+    except (locale.Error, ValueError):
         return None
     return language_code
 

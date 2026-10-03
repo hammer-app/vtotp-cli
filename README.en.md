@@ -1,10 +1,10 @@
-English | [日本語](README.md)
-
 # vtotp
+
+English | [日本語](README.md)
 
 A high-security CLI TOTP (Time-based One-Time Password) authenticator built with practicality and robustness on Windows in mind.
 
-It physically separates the master key from encrypted data, guarantees that secrets never appear in memory dumps or logs (Zero Leakage Rule), and fully handles Windows-specific path-input quirks.
+It physically separates the master key from encrypted data, ensures plaintext secrets are never persisted to disk and never leak into display outputs or logs (Zero Leakage Rule), and fully handles Windows-specific path-input quirks.
 
 ---
 
@@ -114,16 +114,26 @@ vtotp init -k "D:\USB\master.key" -l en
 
 ### 2. Register a service (`add`)
 
-Registers a Base32-encoded TOTP secret. Pass it directly with `--secret` (short form: `-s`).
+Registers a Base32-encoded TOTP secret.
+
+For manual use, entering the secret via the interactive prompt (masked input) is recommended as it never touches your terminal history. For scripts and automated pipelines, secrets can be passed via standard input using the `--stdin` option.
+
+<!-- Note -->
+> **Note**: Specifying secrets via CLI arguments (`--secret` / `-s`) has been completely removed for security reasons, preventing plaintext secrets from leaking into shell history (`.bash_history`, PowerShell Readline history) or process lists (`ps`, `Get-Process`).
+<!-- Warning -->
+> **Warning (Shell history precaution)**: In an interactive terminal, piping secrets directly like `echo "SECRET" | vtotp add ... --stdin` will leave the plaintext secret in your shell's command history. When piping via stdin, use a temporary file (securely wiped after registration) or pipe from a password manager / secure secret store.
 
 ```powershell
-# Enter it interactively (recommended: it never touches your shell history)
+# Enter interactively (recommended: masked input, never touches shell history)
 vtotp add github
+vtotp add aws --issuer Amazon
 
-# Pass it directly as an argument (--secret / -s)
-vtotp add aws --secret JBSWY3DPEHPK3PXP --issuer Amazon
-vtotp add aws -s JBSWY3DPEHPK3PXP --issuer Amazon
+# Pass via standard input pipe (PowerShell: piping from a file or secret store)
+Get-Content secret.txt | vtotp add aws --stdin
+Get-Content secret.txt | vtotp add aws --issuer Amazon --stdin
 
+# (Reference) Linux / macOS file pipe example:
+# cat secret.txt | vtotp add aws --stdin
 ```
 
 ### 3. Generate a TOTP code (`generate`, aliases: `get` / `-g`, or the shorthand form)
@@ -196,11 +206,12 @@ vtotp's command line follows two rules, chosen to keep behavior predictable for 
 # Valid (SERVICE right after the subcommand; options go afterward, in any order)
 vtotp get github -l ja
 vtotp get github --key "PATH" -l ja
+vtotp add aws --stdin -l ja
 
 # Not supported (rejected with exit code 2)
 vtotp get -l ja github
 vtotp get --key "PATH" github
-
+vtotp add --stdin aws
 ```
 
 ---

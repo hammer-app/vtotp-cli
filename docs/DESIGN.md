@@ -9,7 +9,8 @@
 - TOTP: RFC 6238準拠
 - 秘密情報は標準出力、ログ、平文ファイルへ出力しない
 - 鍵ファイルと暗号化データファイルは分離する
-- TOTPシークレットは処理中のみメモリ上で扱う
+- 復号された平文シークレットおよび秘密鍵はディスクへ永続化せず、必要な処理スコープ内だけで一時的に扱い、処理終了後は速やかに参照を破棄する
+- インメモリ秘密情報の扱いは、ディスクへの非永続化と処理スコープの最小化を目的とする。実行中のメモリから秘密情報を完全に消去することは保証しない
 
 > `cryptography.fernet` は内部でAESを使用するが、AES-256-GCMを明示的に要求する場合は `AESGCM` を使用する。
 
@@ -126,7 +127,7 @@ JSON全体を暗号化し、ファイルにはメタデータと暗号文だけ�
 ```text
 - Python標準ライブラリで追加依存が不要
 - Windows / Linux / macOSで動作差が少ない
-- -g、-k、--secret、--forceなどを明確に定義できる
+- -g、-k、--stdin、--forceなどを明確に定義できる
 - サブコマンドとエイリアスを細かく制御できる
 - vtotp <service> の独自フォールバック処理を実装しやすい
 - CLIの挙動を予測しやすい
@@ -199,6 +200,12 @@ class InvalidKeyError(TotpCliError):
     pass
 
 
+class KeyStorageError(TotpCliError):
+    """鍵ファイルの生成・保存またはアクセス権設定に失敗した場合の例外"""
+
+    exit_code: int = 1
+
+
 class StorageCorruptedError(TotpCliError):
     pass
 
@@ -242,14 +249,18 @@ class KeyManager:
         ...
 
     def create_key_file(self, path: Path, key: bytes | None = None) -> None:
-        """鍵を生成または受け取り、指定された外部パスへ保存する"""
+        """鍵を生成または受け取り、安全に一時保存して指定パスへ配置する"""
         ...
 
     def rotate_key_file(self, path: Path, new_key: bytes) -> Path:
         """
-        既存鍵を世代番号付きファイルへ繰り上げ、最古の鍵を必要に応じて削除し、
-        新鍵をpathへ保存する。
-        上限到達時の削除は、呼び出し元の対話確認後に実行する。
+        既存の最古世代 `<key_path>.3` を同一ディレクトリ内の一時退避ファイル
+        `<key_path>.3.<hex>.old` へ移動してから、既存鍵を世代番号付きファイルへ
+        繰り上げ、新鍵をpathへ保存する。
+        成功した各移動操作をロールバックスタック（completed_moves）へ登録し、
+        途中で失敗した場合は逆順ロールバックで全移動を復元する。
+        退避ファイルは新鍵の最終配置が成功した場合にのみ削除する。
+        上限到達時の退避・削除は、呼び出し元の対話確認後に実行する。
         """
         ...
 
@@ -287,17 +298,129 @@ class KeyManager:
     def validate_key_file(self, path: Path) -> None:
         """存在、通常ファイル、サイズ、読み取り可否を検証する"""
         ...
+
+    def set_private_permissions(self, path: Path) -> None:
+        """鍵ファイルを実行ユーザーだけが読み書きできる状態にする"""
+        ...
+
+    def verify_windows_dacl(self, path: Path) -> None:
+        """
+        Windowsで対象ファイルのDACLを検査し、許可リスト外のアカウントへの
+        明示的な許可ACEが存在する場合はKeyStorageErrorを送出する
+        """
+        ...
 ```
 
-### 設計上の注意
+### 鍵ファイル保存とパーミッション制御
+
+鍵の新規作成・更新は、既存ファイルを直接開かず、対象パスと同じディレクトリに
+一時ファイルを作成してから `os.replace` で配置する。`create_key_file` と
+`rotate_key_file` は次の共通フローを使用する。
 
 ```text
-    - 通常の読み込み処理では、指定された外部パスに既存の鍵ファイルがあることを必須にする
-    - initでは、指定された外部パスへ新規鍵を生成・保存する
-    - rekeyでは、既存鍵をpath.1へ退避してから同じpathへ新鍵を保存する
-    - WindowsではACL、Unix系では0600相当の権限を検証する
-- 鍵の内容をエラーメッセージに含めない
+1. 親ディレクトリを作成または検証する。
+2. 予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
+3. 一時ファイルに実行ユーザー専用のパーミッション/ACLを設定する。
+4. Windowsでは、icacls適用完了後にDACL許可リスト再検証を実行する。
+   許可リスト外の許可ACEを検出した場合は一時ファイルを削除して中断する。
+5. 鍵を書き込み、flushおよびfsyncを実行する。
+6. 32バイトであることを検証し、`os.replace(temp_path, path)` で原子的に配置する。
+7. 成功時も失敗時も、一時ファイルが残っていれば削除する。
 ```
+
+`set_private_permissions` は外部依存パッケージを使用せず、OSごとに次の標準機能を
+使う。権限設定は鍵のバイト列を書き込む前に行う。
+
+- **Unix系:** `os.chmod(path, 0o600)` を実行する。所有者以外の読み取り・書き込みを
+    許可しない。
+- **Windows:** `subprocess.run` で標準コマンド `icacls` を呼び出し、継承を無効化して
+    現在のユーザーへ明示的な読み取り・書き込み・削除権限だけを付与する。概念上の実行内容は
+    次の通りであり、実装では `shell=True` を使わず引数配列として渡す。
+
+    ```text
+    <GetSystemDirectoryW()の戻り値>\icacls.exe <path> /inheritance:r /grant:r "*<現在のユーザーSID>:(R,W,D)"
+    ```
+
+    `icacls.exe` のパスは `GetSystemDirectoryW` で取得した System32 の絶対パスから構成し、
+    `SystemRoot` 等の環境変数や PATH 検索には依存しない。ACL の付与先は環境変数や
+    `getpass.getuser()` から推測せず、`OpenProcessToken` と `GetTokenInformation(TokenUser)`
+    で取得したプロセストークンの真のユーザー SID を使用する。SID は `icacls` が受け付ける
+    `*S-1-...` 形式で引数配列に渡す。Win32 API の取得失敗も `KeyStorageError` として処理を
+    中断する。`subprocess.run(..., check=True, capture_output=True)` で終了コードを検査し、
+    標準出力・標準エラーには鍵の内容を含めず、失敗時のコマンド出力もユーザー向け例外へ
+    そのまま流さない。
+
+  - `D`（削除）を含めるのは、親フォルダの権限が「変更」のみ（子の削除権限なし）の
+    環境で、`(R,W)` だけでは `os.replace` による配置・世代繰り上げ・一時ファイル
+    削除が拒否されるためである。付与先は実行ユーザーのみであり、排他性は変わらない。
+  - 親フォルダから継承可能な権限がない場合など、OSまたはトークンの既定 DACL から付与
+    される `SYSTEM`、`Administrators`、`OWNER RIGHTS` の ACE、および現在のログオン
+    セッションを表す Logon SID（`S-1-5-5-...`）の ACE は残存を許容する。これらは
+    Windows の管理・所有者・セッションに結び付くエントリであり、任意の一般ユーザーへ
+    アクセスを許可するものではない。これらの ACE を除く一般ユーザーのアクセスは遮断
+    されていなければならない。この残存許容範囲は後述の「Windows DACL 許可リスト
+    再検証」のホワイトリストと一致し、icacls 適用後に機械的に再検証する。
+
+ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace のいずれかが失敗した
+場合は、既存の `pass` で握りつぶさない。`OSError`、`subprocess.CalledProcessError`
+等を秘密情報を含まない `KeyStorageError` へ変換して処理を中断する。一時ファイルの
+削除を `finally` で試み、削除自体にも失敗した場合は元のエラーを優先しつつ、ログには
+鍵の内容を出さない。保存完了前に失敗した場合、既存の正式な鍵ファイルは変更しない。
+
+通常の `load_key` / `verify_key_file` の読み込み経路では、パーミッションやACLの検査を
+強制しない。FAT32 / exFAT のUSBメディアではUnixモードビットやWindows ACLが期待通り
+に保持されないためであり、読み取り時は存在、通常ファイル、読み取り可否、32バイトの
+形式だけを検証する。排他的なパーミッション設定は、鍵ファイルを生成・保存する処理
+に限定する。
+
+鍵の内容を例外メッセージ、ログ、サブプロセス出力へ含めない。
+
+### Windows DACL 許可リスト再検証
+
+`icacls` による ACL 設定は、権限の継承元やトークンの既定 DACL によって、実行
+ユーザー以外の明示的な許可 ACE が残存する場合がある。Issue #12 の受入条件である
+「作成後のファイル権限の再検証」を満たすため、Windows 環境では一時ファイルへの
+`icacls` 適用完了後、鍵バイト列の書き込み前に、DACL の許可リスト再検証を必須とする。
+
+- **適用契機:** 一時ファイルへの `icacls` 適用完了後、鍵データの書き込み前に実行する。
+    再検証は一時ファイルに対して行う。`os.replace` は同一ファイルの ACL を保持した
+    まま移動するため、正式配置後の再検証は不要とする。
+- **実装方針:** 外部依存ライブラリを追加せず、標準ライブラリの `ctypes` から
+    `advapi32.dll` の Win32 API を呼び出して DACL を検査する。`GetNamedSecurityInfoW`
+    で `DACL_SECURITY_INFORMATION` を指定して DACL を取得し、`GetAce` で各 ACE を
+    走査し、ACE の SID を `ConvertSidToStringSidW` で文字列化して許可リストと照合する。
+    現在のセッションの Logon SID は `GetTokenInformation(TokenGroups)` で取得した
+    グループ SID のうち `SE_GROUP_LOGON_ID` 属性を持つ SID から特定する。
+    これらの Win32 API 呼び出しが失敗した場合も検証不能とみなし、`KeyStorageError`
+    で処理を中断する。
+- **許可 ACE ホワイトリスト:**
+  - カレントユーザー（`OpenProcessToken` / `GetTokenInformation(TokenUser)` で
+    取得した実行ユーザー SID）
+  - `NT AUTHORITY\SYSTEM`（`S-1-5-18`）
+  - `BUILTIN\Administrators`（`S-1-5-32-544`）
+  - `OWNER RIGHTS`（`S-1-3-4`）
+  - 現在のログオンセッション SID（プロセストークンの `TokenGroups` から取得した、
+    現在のプロセスに紐づく Logon SID）
+- **検証ルール:** 上記許可リストに含まれないアカウントに対する明示的な許可 ACE
+    （`ACCESS_ALLOWED_ACE`）が 1 つでも存在する場合は、即座に `KeyStorageError`
+    （終了コード 1）を送出し、一時ファイルを安全に削除して処理を中断する。既存の
+    正式な鍵ファイルは変更しない。
+
+  検証はフェイルクローズ（安全側に倒す）とし、次の場合はすべて検証不能として
+  拒否する。
+
+  - **NULL DACL の拒否:** セキュリティ記述子が DACL を保持しない（NULL DACL）
+    場合は、全ユーザーにフルアクセスを許可する状態と同等であり検証不能であるため、
+    `KeyStorageError` を送出して処理を中断する。
+  - **未解釈 ACE 種別の拒否:** SID のオフセットを安全に解釈できない ACE 種別
+    （`ACCESS_ALLOWED_OBJECT_ACE` 等の OBJECT 形式を含む、本仕様で列挙しない
+    許可 ACE 種別）が 1 つでも含まれる場合は、許可対象を確定できないため検証不能
+    として `KeyStorageError` を送出して処理を中断する。
+  - **拒否 ACE のスキップ:** 拒否 ACE（`ACCESS_DENIED_ACE`、OBJECT・CALLBACK・
+    CALLBACK_OBJECT 形式を含むすべての拒否 ACE）はアクセス権を付与しないため、
+    本検証の対象外としスキップする。
+
+再検証で送出する例外メッセージやログにも、鍵の内容を含めない。
 
 ## 7. SecureStorage
 
@@ -572,6 +695,10 @@ class CliHandler:
         """正規化後の引数を解析する"""
         ...
 
+    def reject_deprecated_secret_args(self, argv: list[str]) -> None:
+        """addの廃止済みシークレット引数を安全に検知する"""
+        ...
+
     def dispatch(self, command: ParsedCommand) -> int:
         """解析済みコマンドをユースケースへ委譲する"""
         ...
@@ -580,6 +707,13 @@ class CliHandler:
         """安全なエラー表示と終了コード変換"""
         ...
 ```
+
+`run()` は引数を正規化した後、実行されたサブコマンドや引数位置（前置・後置）に
+関わらず、CLI引数列全体（`argv`）を `argparse` に渡す前に
+`reject_deprecated_secret_args()` で事前検査する。`--secret` / `-s` が指定されていたら、
+引数列や該当値を表示・ログ出力・例外コンテキストへ複製せず、固定の
+`SECRET_ARG_DEPRECATED` を持つ `CommandParseError` に変換する。これにより、
+`argparse` 標準の `unrecognized arguments: ...` が秘密値をエコーバックする経路を遮断する。
 
 ## 12. CLIコマンド定義
 
@@ -590,8 +724,7 @@ vtotp generate SERVICE [--key PATH] [--storage PATH]
 vtotp get SERVICE [--key PATH] [--storage PATH]
 vtotp -g SERVICE [--key PATH] [--storage PATH]
 
-vtotp add SERVICE [--secret SECRET] [--issuer ISSUER]
-                  [--key PATH] [--storage PATH]
+vtotp add SERVICE [--issuer ISSUER] [--stdin] [--key PATH] [--storage PATH]
 
 vtotp remove SERVICE [--force]
                     [--key PATH] [--storage PATH]
@@ -658,13 +791,29 @@ vtotp rm --force --key PATH github
 ```
 
 `MAX_ROTATED_KEYS = 3` とし、rekeyのたびに既存の鍵を次の世代へ繰り上げる。
+`<key_path>.3` が存在する場合は、世代繰り上げの前に最古世代を同一ディレクトリ内の
+一時退避ファイルへ移動してから繰り上げを開始する。
 
 ```text
-<key_path>.2 -> <key_path>.3
-<key_path>.1 -> <key_path>.2
-<key_path>   -> <key_path>.1
-新鍵         -> <key_path>
+0. <key_path>.3 -> <key_path>.3.<hex>.old  # .3が存在する場合のみ退避
+1. <key_path>.2 -> <key_path>.3
+2. <key_path>.1 -> <key_path>.2
+3. <key_path>   -> <key_path>.1
+4. 新鍵         -> <key_path>              # 最終配置
+5. <key_path>.3.<hex>.old を削除           # 最終配置の成功後のみ
 ```
+
+退避ファイル名の `<hex>` は予測困難なランダムな16進数とし、同一ディレクトリ内で
+衝突しない名前を生成する。すべての移動は同一ディレクトリ内への `os.replace` で
+実行し、成功した各操作をロールバックスタック（`completed_moves`）へ
+(移動元, 移動先) として登録する。途中の移動または最終配置が失敗した場合は、
+スタックを逆順に `os.replace(移動先, 移動元)` で復元し、退避した `.3` を含む
+全世代を失敗前の配置へ戻す。ロールバック自体に失敗した場合は元のエラーを優先し、
+秘密情報を含まない `KeyStorageError` で中断する。
+
+最終配置（新鍵の `os.replace`）が成功した場合にのみ、退避ファイル
+`<key_path>.3.<hex>.old` を削除する。削除に失敗した場合は例外を送出せず無視する。
+この方式により、最終配置が失敗した場合でも既存の最古世代 `.3` の消失を防ぐ。
 
 `<key_path>.3` が存在する場合は、最初に次の警告を表示する。専用の強制オプションは設けない。
 
@@ -678,7 +827,7 @@ vtotp rm --force --key PATH github
 今後復号できなくなる可能性があります。続行しますか？
 ```
 
-続行の明示応答が得られた場合だけ `<key_path>.3` を削除して繰り上げを実行し、拒否、空入力、キャンセルの場合はrekeyを中止する。暗号化済みTOTPシークレットファイルには `.1`、`.2`、`.3` のローテーションを作成しない。
+続行の明示応答が得られた場合だけ `<key_path>.3` を一時退避ファイルへ移動して繰り上げを実行し、新鍵の最終配置が成功した後に退避ファイルを削除する。拒否、空入力、キャンセルの場合はrekeyを中止する。暗号化済みTOTPシークレットファイルには `.1`、`.2`、`.3` のローテーションを作成しない。
 
 ### rekeyの鍵パス
 
@@ -815,10 +964,17 @@ CliHandler
 
 ```text
 CliHandler
+    -> --stdin未指定時: 標準入力のTTY判定（鍵・ストレージへのアクセス前）
+         非TTY: STDIN_OPTION_REQUIREDで終了コード2、以降のファイルアクセスを行わず終了
+         TTY: 続行
+    -> --stdin指定時: TTY判定をスキップして続行
     -> ConfigManager
     -> KeyManager.load_key()
     -> SecureStorage.load()
-    -> SecretInputReader.read_secret()
+    -> シークレット入力経路の判定
+         --stdin指定時: SecretInputReader.read_secret()
+             標準入力をUTF-8として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾のCR/LF改行を除去する（マスキングなし）
+         --stdin未指定時（TTY確認済み）: SecretInputReader.read_secret()でマスキング入力し、空入力時はキャンセルする
     -> TotpGenerator.validate_secret()
     -> ServiceRegistry.add_or_update()
     -> SecureStorage.save()
@@ -883,6 +1039,10 @@ CliHandler
 7   ユーザーキャンセル
 ```
 
+鍵ファイルの保存、一時ファイル処理、UnixパーミッションまたはWindows ACL設定の失敗は
+`KeyStorageError` とし、一般的なファイル I/O 失敗として終了コード `1` を返す。
+終了コード `3` は鍵ファイルの不在または形式不正に限る。
+
 ## 16. テスト設計
 
 ### Unit Test
@@ -890,6 +1050,7 @@ CliHandler
 ```text
 - 32バイト鍵が生成される
 - 不正サイズの鍵を拒否する
+- 許可リスト外の許可ACEを持つDACLをWindows再検証で拒否する
 - 暗号化と復号で元データが復元される
 - 改ざんされた暗号文を拒否する
 - サービスの追加・更新・削除が機能する
@@ -911,7 +1072,9 @@ CliHandler
 - 既存の`.1`、`.2`が正しい世代へ繰り上げられる
 - `<key_path>.3`が存在する場合は上限警告を表示する
 - 上限警告への明示的な続行応答がない場合はrekeyを中止する
-- 上限警告で続行した場合だけ`<key_path>.3`を削除する
+- 上限警告で続行した場合だけ`<key_path>.3`を退避・削除する
+- ローテーション途中の失敗時に退避した`.3`が逆順ロールバックで復元される
+- 新鍵の最終配置が成功した場合にのみ退避ファイル（`.old`）が削除される
 - rekey後の暗号化データにローテーション用の`.1`ファイルを作成しない
 - 旧鍵ではrekey後の暗号化データを復号できない
 - `--key`指定時は対象パスだけが更新され、config.jsonが変更されない
@@ -923,13 +1086,22 @@ CliHandler
 ## 17. セキュリティ上の留意点
 
 ```text
-- Pythonでは完全なメモリ消去を保証しにくいため、
-  シークレットを長時間保持せず処理スコープを限定する。
+- 復号された平文シークレットおよび秘密鍵はディスクへ永続化せず、必要な処理スコープ内だけで一時的に扱う。
+  処理終了後は参照を速やかに破棄し、秘密情報をメモリ上に保持する時間と範囲を最小化する。
+
+- PythonインタプリタおよびNuitkaコンパイル後を含むネイティブ実行環境では、
+  ガベージコレクションやイミュータブルオブジェクト等のメモリ管理上の特性により、
+  プロセス実行中のメモリから秘密情報を完全にゼロ化できるとは限らない。
+  そのため、実行中のメモリダンプやデバッガによるインメモリ解析に対する
+  完全なメモリ消去・漏洩耐性を保証するものではない。
+
+- 本設計の境界は、秘密情報をディスクへ永続化しないこと、および必要な処理スコープに
+  扱いを限定することにある。インメモリの完全なゼロ化や、プロセス実行中の解析に対する
+  完全な防御を保証するものではない。
 
 - 秘密情報を例外メッセージ、デバッグログ、argparseのusage表示へ混入させない。
 
-- --secretで渡した値はOSのプロセス一覧やシェル履歴に残る可能性があるため、
-  未指定時の対話入力を推奨する。
+- コマンドライン引数による平文シークレットの直接受け渡しは全面的に廃止・禁止し、シェル履歴、OSのプロセス一覧、プロセス監査ログへの露出を根本排除する。
 
 - 暗号化ファイルには認証付き暗号を使用する。
 
@@ -1166,13 +1338,23 @@ class MsgKey(StrEnum):
     SERVICE_NOT_FOUND = "service_not_found"
     INVALID_SECRET = "invalid_secret"
     COMMAND_PARSE_ERROR = "command_parse_error"
+    SECRET_ARG_DEPRECATED = "secret_arg_deprecated"
+    STDIN_OPTION_REQUIRED = "stdin_option_required"
     CONFIG_SUMMARY = "config_summary"
     CONFIG_LANGUAGE_UPDATED = "config_language_updated"
 
 
 Catalog = Mapping[MsgKey, str]
-EN_CATALOG: Catalog = {...}
-JA_CATALOG: Catalog = {...}
+EN_CATALOG: Catalog = {
+    # 他のメッセージキーは省略
+    MsgKey.SECRET_ARG_DEPRECATED: "The --secret/-s option has been removed for security. Use interactive prompt or --stdin.",
+    MsgKey.STDIN_OPTION_REQUIRED: "Standard input is not a terminal. Use --stdin to pass secrets via pipe or redirect.",
+}
+JA_CATALOG: Catalog = {
+    # 他のメッセージキーは省略
+    MsgKey.SECRET_ARG_DEPRECATED: "--secret/-s オプションはセキュリティのため廃止されました。対話入力または --stdin を使用してください。",
+    MsgKey.STDIN_OPTION_REQUIRED: "標準入力がターミナルではありません。パイプやリダイレクトでシークレットを渡す場合は --stdin を指定してください。",
+}
 SUPPORTED_LANGUAGES = ("en", "ja")
 ```
 
@@ -1236,7 +1418,7 @@ vtotp <command-or-service> [SERVICE] [options...]
 vtotp init [--key PATH] [--lang en|ja]
 vtotp generate SERVICE [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp get SERVICE [--key PATH] [--storage PATH] [--lang en|ja]
-vtotp add SERVICE [--secret SECRET] [--issuer ISSUER] [--key PATH] [--storage PATH] [--lang en|ja]
+vtotp add SERVICE [--issuer ISSUER] [--stdin] [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp remove SERVICE [--force] [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp list [--key PATH] [--storage PATH] [--lang en|ja]
 vtotp rekey [--key PATH] [--storage PATH] [--lang en|ja]
@@ -1247,6 +1429,28 @@ vtotp config set language en|ja [--lang en|ja]
 `-g`、`rm`、`ls` はそれぞれ既存の別名として同じ契約へ正規化する。`config -l/--lang`
 は `config set language` と同等に `language` を保存する。設定更新時の表示言語も、
 指定された新言語を使用する。
+
+### 20.3 廃止シークレット引数の安全な拒否
+
+CLI引数列全体（`argv`）を `argparse` の解析前に事前走査し、実行されるコマンド名や
+引数の指定位置（前置・後置）に関わらず、廃止済みの `--secret`、`-s` および
+値を同一トークンに結合した形式・省略形式（`--secret=VALUE`、`-sVALUE`、`--sec`等）を検知する。検知時は
+`argparse` に引数を渡さず、`CommandParseError`（終了コード2、メッセージキー
+`SECRET_ARG_DEPRECATED`、空のコンテキスト）で直ちに終了する。表示は翻訳済みの固定メッセージ
+だけとし、入力された引数列、値、`argparse` の標準エラー文を含めない。これにより、
+`unrecognized arguments: ...` によるシークレット値のエコーバックを防ぐ。
+
+### 20.4 非TTY環境での `--stdin` 必須化
+
+`add` で `--stdin` が指定されていない場合、シークレットの対話入力へ進む前に標準入力の
+TTY状態を確認する。この判定は鍵ファイルや暗号化ストレージを読み込む前に行い、標準入力が
+TTYでない（パイプ、リダイレクト、またはTTY判定を提供しない入力ストリーム）場合は、
+鍵ファイルや暗号化ストレージの不在・破損等の状態に関わらず、`STDIN_OPTION_REQUIRED` を持つ
+`CommandParseError`（終了コード2、空のコンテキスト）を送出してプロンプトを表示せず即座に
+終了する。TTYの場合のみ、
+マスキング付きの対話入力を行う。`--stdin` 指定時はこのTTY判定を行わず、標準入力をUTF-8
+として読み込み、先頭のUTF-8 BOM（U+FEFF、多重付与を含む）と末尾CR/LF改行を除去した値を
+Base32形式の検証へ渡す。
 
 ## 21. ドメイン例外と表示層の連携
 
@@ -1268,6 +1472,10 @@ raise KeyNotFoundError(context={"path": display_path})
 を維持して `stderr` へ出力する。`str(error)`、traceback、低レベル例外の生メッセージを
 ユーザー出力へ流さない。これにより、core/domain層は言語に依存せず、表示層だけが
 ローカライズ責務を持つ。
+
+廃止された `--secret` / `-s` の検知には、新たな例外型を設けず `CommandParseError` を使う。
+この場合は終了コード `2`、メッセージキー `SECRET_ARG_DEPRECATED`、秘密値や生引数を含まない
+空のコンテキストを設定する。表示層はカタログの固定文だけを出力する。
 
 ## 22. PEメタデータとリリースCI
 

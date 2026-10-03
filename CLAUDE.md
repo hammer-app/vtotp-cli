@@ -1,7 +1,16 @@
 # Project Guidelines: vtotp
 
 Custom CLI TOTP Authenticator built in Python.
-Refer to `@docs/REQUIREMENTS.md` for functional requirements and `@docs/DESIGN.md` for detailed architectural design specs.
+Refer to `docs/REQUIREMENTS.md` for functional requirements and `docs/DESIGN.md` for detailed architectural design specs.
+
+## Operational Rules & Behavioral Guidelines
+
+- **No Direct Document Modification:**
+  - Do not directly edit or commit documentation files (`docs/REQUIREMENTS.md`, `docs/DESIGN.md`, `README.*`, `SECURITY.md`, etc.).
+  - If discrepancies are identified between documentation and actual implementation or CLI behavior, report them in review steps instead of modifying files directly.
+- **Human-Led Git Operations:**
+  - For change safety and governance, Git commits and pushes must strictly be performed by human developers (unless explicitly instructed for exceptional cases such as automated CI repair).
+  - Claude Code must report verification results upon task completion and handle PR creation only after human developers have pushed the commits.
 
 ## Command Guidelines & Commands
 
@@ -49,7 +58,7 @@ Refer to `@docs/REQUIREMENTS.md` for functional requirements and `@docs/DESIGN.m
 ### 4. Error Handling & Exit Codes
 
 - Use custom exception hierarchy derived from `TotpCliError` (`KeyNotFoundError`, `StorageCorruptedError`, `ServiceNotFoundError`, etc.).
-- Map exceptions strictly to specified exit codes (0: Success, 1: General, 2: CLI Arg, 3: Key Err, 4: Storage/Decrypt Err, 5: Service Not Found, 6: Invalid Secret, 7: Cancelled).
+- Map exceptions strictly to specified exit codes (0: Success, 1: General, 2: CLI Arg, 3: Key missing/invalid, 4: Storage/Decrypt Err, 5: Service Not Found, 6: Invalid Secret, 7: Cancelled).
 - `CliHandler` must intercept all `TotpCliError` exceptions and gracefully map them to user-friendly `stderr` messages.
 
 ### 5. Testing Requirements
