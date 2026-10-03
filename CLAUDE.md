@@ -58,7 +58,7 @@ Refer to `docs/REQUIREMENTS.md` for functional requirements and `docs/DESIGN.md`
 ### 4. Error Handling & Exit Codes
 
 - Use custom exception hierarchy derived from `TotpCliError` (`KeyNotFoundError`, `StorageCorruptedError`, `ServiceNotFoundError`, etc.).
-- Map exceptions strictly to specified exit codes (0: Success, 1: General, 2: CLI Arg, 3: Key Err, 4: Storage/Decrypt Err, 5: Service Not Found, 6: Invalid Secret, 7: Cancelled).
+- Map exceptions strictly to specified exit codes (0: Success, 1: General, 2: CLI Arg, 3: Key missing/invalid, 4: Storage/Decrypt Err, 5: Service Not Found, 6: Invalid Secret, 7: Cancelled).
 - `CliHandler` must intercept all `TotpCliError` exceptions and gracefully map them to user-friendly `stderr` messages.
 
 ### 5. Testing Requirements
