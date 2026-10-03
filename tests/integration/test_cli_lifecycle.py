@@ -203,6 +203,54 @@ class TestFullLifecycle:
         assert new_key_bytes.hex() not in combined_log
 
 
+class TestRekeyGenerationLimit:
+    """世代上限（`.3`）到達後のrekeyに関するE2Eテスト。"""
+
+    def test_fourth_rekey_rotates_generations_without_leftover_files(
+        self, home_dir: Path, tmp_path: Path
+    ) -> None:
+        """4回目のrekeyで上限警告に同意すると最古世代だけが破棄され、退避ファイル等が残らないことを確認する。
+
+        Windowsでは各鍵の保存時に、実際のDACL許可リスト再検証も通過する。
+        """
+        key_dir = tmp_path / "keys"
+        key_path = key_dir / "master.key"
+        result = _run_cli(["init", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        result = _run_cli(
+            ["add", "github", "--key", str(key_path), "--stdin"],
+            home_dir,
+            stdin_text=f"{_GITHUB_SECRET}\n",
+        )
+        assert result.returncode == 0, result.stderr
+
+        history = [key_path.read_bytes()]
+        for _ in range(3):
+            result = _run_cli(["rekey", "--key", str(key_path)], home_dir)
+            assert result.returncode == 0, result.stderr
+            history.append(key_path.read_bytes())
+        assert Path(f"{key_path}.3").read_bytes() == history[0]
+
+        # 4回目: .3 が存在するため上限警告が表示され、"y" で続行する。
+        result = _run_cli(["rekey", "--key", str(key_path)], home_dir, stdin_text="y\n")
+        assert result.returncode == 0, result.stderr
+        assert f"{key_path}.3" in result.stderr
+
+        assert Path(f"{key_path}.1").read_bytes() == history[3]
+        assert Path(f"{key_path}.2").read_bytes() == history[2]
+        assert Path(f"{key_path}.3").read_bytes() == history[1]
+        assert sorted(p.name for p in key_dir.iterdir()) == [
+            "master.key",
+            "master.key.1",
+            "master.key.2",
+            "master.key.3",
+        ]
+
+        result = _run_cli(["generate", "github", "--key", str(key_path)], home_dir)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().isdigit()
+
+
 class TestArgumentAndEnvironmentIntegration:
     """`-k`/`--key`とVTOTP_KEY_PATH環境変数の統合シナリオに関するテスト。"""
 

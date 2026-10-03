@@ -39,6 +39,45 @@ _TOKEN_USER_CLASS: int = 1
 #: `GetSystemDirectoryW` に渡すバッファの文字数（拡張パス長の上限）。
 _SYSTEM_DIRECTORY_BUFFER_CHARS: int = 32768
 
+#: `GetNamedSecurityInfoW` の対象種別 `SE_FILE_OBJECT`。
+_SE_FILE_OBJECT: int = 1
+
+#: `GetNamedSecurityInfoW` で DACL を要求する `DACL_SECURITY_INFORMATION`。
+_DACL_SECURITY_INFORMATION: int = 0x00000004
+
+#: アクセスを許可する ACE 種別のうち、SID がヘッダーとアクセスマスクの直後に
+#: 続く形式（`ACCESS_ALLOWED_ACE` / `ACCESS_ALLOWED_CALLBACK_ACE`）。
+_ACCESS_ALLOWED_ACE_TYPES: frozenset[int] = frozenset({0x00, 0x09})
+
+#: アクセスを拒否する ACE 種別（`ACCESS_DENIED_ACE` と、その OBJECT /
+#: CALLBACK / CALLBACK_OBJECT 版）。許可を与えないため再検証の対象外とする。
+_ACCESS_DENIED_ACE_TYPES: frozenset[int] = frozenset({0x01, 0x06, 0x0A, 0x0C})
+
+#: `ACE_HEADER`（4バイト）と `ACCESS_MASK`（4バイト）に続く SID の開始位置。
+_ACE_SID_OFFSET: int = 8
+
+
+class _AclHeader(ctypes.Structure):
+    """Win32 の `ACL` 構造体（ACE 本体はこのヘッダーの後に続く）。"""
+
+    _fields_ = [
+        ("AclRevision", ctypes.c_uint8),
+        ("Sbz1", ctypes.c_uint8),
+        ("AclSize", ctypes.c_uint16),
+        ("AceCount", ctypes.c_uint16),
+        ("Sbz2", ctypes.c_uint16),
+    ]
+
+
+class _AceHeader(ctypes.Structure):
+    """Win32 の `ACE_HEADER` 構造体。"""
+
+    _fields_ = [
+        ("AceType", ctypes.c_uint8),
+        ("AceFlags", ctypes.c_uint8),
+        ("AceSize", ctypes.c_uint16),
+    ]
+
 
 def _load_windows_library(name: str) -> Any:
     """Win32 のDLLを読み込む（テストで偽のDLLへ差し替え可能にするための関数）。
@@ -69,6 +108,33 @@ def _windows_system_directory() -> str:
     return buffer.value
 
 
+def _configure_sid_conversion(advapi32: Any, kernel32: Any) -> None:
+    """`ConvertSidToStringSidW` と `LocalFree` の引数・戻り値の型を設定する。"""
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+
+def _sid_to_string(advapi32: Any, kernel32: Any, sid: int | None) -> str:
+    """バイナリ SID を `S-1-...` 形式の文字列へ変換する。
+
+    `ConvertSidToStringSidW` が確保した文字列領域は必ず解放する。変換に
+    失敗した場合は :class:`OSError` を送出する。呼び出し前に
+    :func:`_configure_sid_conversion` で型を設定しておくこと。
+    """
+    string_sid = ctypes.c_void_p()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(string_sid)):
+        raise OSError("ConvertSidToStringSidW failed")
+    try:
+        return ctypes.wstring_at(string_sid)
+    finally:
+        kernel32.LocalFree(string_sid)
+
+
 def _current_user_sid() -> str:
     """現在のプロセストークンからユーザー SID（`S-1-5-21-...` 形式）を返す。
 
@@ -83,8 +149,7 @@ def _current_user_sid() -> str:
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
+    _configure_sid_conversion(advapi32, kernel32)
     advapi32.OpenProcessToken.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint32,
@@ -99,11 +164,6 @@ def _current_user_sid() -> str:
         ctypes.POINTER(ctypes.c_uint32),
     ]
     advapi32.GetTokenInformation.restype = ctypes.c_int
-    advapi32.ConvertSidToStringSidW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
 
     token = ctypes.c_void_p()
     if not advapi32.OpenProcessToken(
@@ -132,15 +192,78 @@ def _current_user_sid() -> str:
         # TOKEN_USER は SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; } で
         # 始まるため、先頭のポインタ値がユーザー SID を指す。
         user_sid = ctypes.cast(token_user, ctypes.POINTER(ctypes.c_void_p))[0]
-        string_sid = ctypes.c_void_p()
-        if not advapi32.ConvertSidToStringSidW(user_sid, ctypes.byref(string_sid)):
-            raise OSError("ConvertSidToStringSidW failed")
-        try:
-            return ctypes.wstring_at(string_sid)
-        finally:
-            kernel32.LocalFree(string_sid)
+        return _sid_to_string(advapi32, kernel32, user_sid)
     finally:
         kernel32.CloseHandle(token)
+
+
+def _granting_ace_sids(path: Path) -> list[str]:
+    """`path` の DACL から、アクセスを許可し得る ACE の SID を文字列で列挙する。
+
+    `GetNamedSecurityInfoW(DACL_SECURITY_INFORMATION)` で DACL を取得し、
+    `GetAce` で走査する。拒否 ACE は許可を与えないため対象外とする。
+    次の場合は検証不能として :class:`OSError` を送出する（フェイルクローズ）。
+
+    - Win32 API（DACL 取得・ACE 取得・SID 文字列化）の失敗
+    - NULL DACL（全員にフルアクセスを与える状態）
+    - SID の位置を解釈できない、許可・拒否以外の ACE 種別
+
+    `GetNamedSecurityInfoW` が確保したセキュリティ記述子は必ず解放する。
+    """
+    advapi32 = _load_windows_library("advapi32")
+    kernel32 = _load_windows_library("kernel32")
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetAce.restype = ctypes.c_int
+    _configure_sid_conversion(advapi32, kernel32)
+
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        raise OSError("GetNamedSecurityInfoW failed")
+    try:
+        if not dacl.value:
+            raise OSError("NULL DACL grants access to everyone")
+        ace_count = ctypes.cast(dacl, ctypes.POINTER(_AclHeader)).contents.AceCount
+        sids: list[str] = []
+        for index in range(ace_count):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+                raise OSError("GetAce failed")
+            ace_type = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents.AceType
+            if ace_type in _ACCESS_DENIED_ACE_TYPES:
+                continue
+            if ace_type not in _ACCESS_ALLOWED_ACE_TYPES:
+                raise OSError("unsupported ACE type in DACL")
+            sid_address = ace.value + _ACE_SID_OFFSET
+            sids.append(_sid_to_string(advapi32, kernel32, sid_address))
+        return sids
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
 class KeyManager:
@@ -164,6 +287,15 @@ class KeyManager:
     #: Dが無いと `os.replace` による配置・世代繰り上げ・一時ファイル削除が失敗する。
     WINDOWS_PRIVATE_GRANT: str = "(R,W,D)"
 
+    #: DACL 再検証で、実行ユーザー以外に許可 ACE の残存を認める既知の SID
+    #: （`SYSTEM` / `Administrators` / `OWNER RIGHTS`。REQUIREMENTS.md 4.1 の注記）。
+    WINDOWS_ALLOWED_WELL_KNOWN_SIDS: frozenset[str] = frozenset(
+        {"S-1-5-18", "S-1-5-32-544", "S-1-3-4"}
+    )
+
+    #: DACL 再検証で許可 ACE の残存を認めるログオンセッション SID の接頭辞。
+    WINDOWS_LOGON_SID_PREFIX: str = "S-1-5-5-"
+
     def generate_key(self) -> bytes:
         """暗号学的に安全な32バイト鍵を生成する。"""
         return secrets.token_bytes(self.KEY_SIZE_BYTES)
@@ -183,11 +315,13 @@ class KeyManager:
         """既存鍵を世代番号付きファイルへ繰り上げ、新鍵を `path` へ保存する。
 
         新鍵を実行ユーザー専用権限の一時ファイルへ書き込み終えてから、
+        既存の最古世代 `<key_path>.3` を `<key_path>.3.<hex>.old` へ退避し、
         `<key_path>.2` -> `<key_path>.3`、`<key_path>.1` -> `<key_path>.2`、
         `path` -> `<key_path>.1` の順に繰り上げ、一時ファイルを `path` へ
-        配置する。繰り上げ・配置に失敗した場合は、実施済みの繰り上げを
-        可能な範囲で元に戻す。上限到達時（`<key_path>.3` が既に存在する場合）
-        の削除可否の確認は、呼び出し元（CliHandler）が事前に対話確認を
+        配置する。退避・繰り上げ・配置に失敗した場合は、実施済みの移動を
+        逆順に元に戻す（退避した `.3` も復元する）。退避ファイルは配置の成功後
+        にのみ削除する。上限到達時（`<key_path>.3` が既に存在する場合）の
+        削除可否の確認は、呼び出し元（CliHandler）が事前に対話確認を
         済ませていることを前提とする。
         """
         self._ensure_valid_key_size(path, new_key)
@@ -302,6 +436,32 @@ class KeyManager:
                 MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
             ) from None
 
+    def verify_windows_dacl(self, path: Path) -> None:
+        """Windowsで `path` の DACL を許可リストと照合する（DESIGN.md 6章）。
+
+        アクセスを許可する ACE の SID が、実行ユーザー（プロセストークンの
+        SID）、:attr:`WINDOWS_ALLOWED_WELL_KNOWN_SIDS`、ログオンセッション SID
+        （:attr:`WINDOWS_LOGON_SID_PREFIX`）のいずれでもない場合は
+        :class:`KeyStorageError` を送出する。拒否 ACE は検証対象外とする。
+        DACL を検証できない場合（Win32 API の失敗等）も同じく中断する。
+        Win32 API の失敗詳細は例外チェーンにも残さない（Zero Leakage Rule）。
+        """
+        context = {"path": str(path)}
+        try:
+            allowed_sids = {_current_user_sid(), *self.WINDOWS_ALLOWED_WELL_KNOWN_SIDS}
+            granted_sids = _granting_ace_sids(path)
+        except OSError:
+            raise KeyStorageError(
+                MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
+            ) from None
+
+        if any(
+            sid not in allowed_sids
+            and not sid.startswith(self.WINDOWS_LOGON_SID_PREFIX)
+            for sid in granted_sids
+        ):
+            raise KeyStorageError(MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context)
+
     def _ensure_valid_key_size(self, path: Path, key: bytes) -> None:
         """保存しようとする鍵が32バイトであることを、ファイル操作の前に検証する。"""
         if len(key) != self.KEY_SIZE_BYTES:
@@ -315,10 +475,11 @@ class KeyManager:
         1. 親ディレクトリを作成または検証する。
         2. 予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
         3. 鍵を書き込む前に、一時ファイルへ実行ユーザー専用の権限を設定する。
-        4. 鍵を書き込み、flushおよびfsyncを実行する。
-        5. 32バイトであることを検証し、`os.replace` で原子的に配置する
+        4. Windowsでは、権限設定の完了後に DACL を許可リストと再検証する。
+        5. 鍵を書き込み、flushおよびfsyncを実行する。
+        6. 32バイトであることを検証し、`os.replace` で原子的に配置する
            （`rotate=True` の場合は配置直前に既存鍵を世代繰り上げする）。
-        6. 成功・失敗を問わず、残存した一時ファイルを削除する。
+        7. 成功・失敗を問わず、残存した一時ファイルを削除する。
 
         いずれかの段階で失敗した場合は :class:`KeyStorageError` を送出する。
         """
@@ -333,6 +494,8 @@ class KeyManager:
             with os.fdopen(fd, "wb") as temp_file:
                 try:
                     self.set_private_permissions(temp_path)
+                    if _is_windows():
+                        self.verify_windows_dacl(temp_path)
                 except KeyStorageError:
                     # 利用者には一時ファイル名ではなく保存先パスを示す。
                     raise KeyStorageError(
@@ -356,13 +519,21 @@ class KeyManager:
     def _place_key_file(self, temp_path: Path, path: Path, *, rotate: bool) -> None:
         """一時ファイルを正式パスへ配置する（必要に応じて世代繰り上げを伴う）。
 
-        繰り上げまたは配置が失敗した場合は、実施済みの繰り上げを逆順に
-        戻してから元の例外を再送出する。
+        世代繰り上げでは、既存の最古世代を同一ディレクトリの退避ファイル
+        （`<key_path>.3.<hex>.old`）へ移してから繰り上げる。退避・繰り上げ
+        または配置が失敗した場合は、実施済みの移動を逆順に戻してから元の
+        例外を再送出する。退避ファイルは配置が成功した場合にのみ削除する。
         """
         completed_moves: list[tuple[Path, Path]] = []
+        parked_oldest: Path | None = None
         try:
             if rotate:
                 chain = [path, *self.rotated_key_paths(path, self.MAX_ROTATED_KEYS)]
+                oldest = chain[-1]
+                if oldest.exists():
+                    parked_oldest = Path(f"{oldest}.{secrets.token_hex(8)}.old")
+                    os.replace(oldest, parked_oldest)
+                    completed_moves.append((oldest, parked_oldest))
                 for index in range(len(chain) - 1, 0, -1):
                     source, destination = chain[index - 1], chain[index]
                     if source.exists():
@@ -376,13 +547,17 @@ class KeyManager:
                     os.replace(destination, source)
             raise
 
+        if parked_oldest is not None:
+            # 新鍵の配置が成功した後にのみ、退避した最古世代を破棄する。
+            self._discard_temp_file(parked_oldest)
+
     @staticmethod
     def _discard_temp_file(temp_path: Path) -> None:
-        """残存した一時ファイルを削除する。
+        """残存した一時ファイル（最古世代の退避ファイルを含む）を削除する。
 
         削除自体の失敗で元の例外（または成功結果）を上書きしないよう、
-        ここでの `OSError` のみ抑止する。一時ファイルは書き込み前に実行
-        ユーザー専用の権限が設定済みである。
+        ここでの `OSError` のみ抑止する。いずれのファイルも鍵の書き込み前に
+        実行ユーザー専用の権限が設定済みである。
         """
         with contextlib.suppress(OSError):
             temp_path.unlink(missing_ok=True)

@@ -591,6 +591,23 @@ def run_recorder(monkeypatch: pytest.MonkeyPatch) -> _RunRecorder:
     return recorder
 
 
+@pytest.fixture
+def dacl_recorder(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """DACL の読み取り（`_granting_ace_sids`）を、実行ユーザーのみを返す記録用スタブへ差し替える。
+
+    force_windows 環境では実際のファイルの DACL と偽のユーザー SID が一致しない
+    ため、Windows 経路を最後まで通すテストで使用する。検査対象のパスを記録する。
+    """
+    inspected: list[Path] = []
+
+    def _record(path: Path) -> list[str]:
+        inspected.append(path)
+        return [_FAKE_USER_SID]
+
+    monkeypatch.setattr(key_manager_module, "_granting_ace_sids", _record)
+    return inspected
+
+
 def _expected_icacls() -> str:
     """force_windows 環境下で期待される icacls.exe の絶対パスを返す。"""
     return str(Path(r"C:\Windows\System32") / "icacls.exe")
@@ -948,8 +965,9 @@ class TestSetPrivatePermissionsWindows:
         tmp_path: Path,
         force_windows: None,
         run_recorder: _RunRecorder,
+        dacl_recorder: list[Path],
     ) -> None:
-        """Windows 経路でも一時ファイルへ ACL を設定してから配置されることを確認する。"""
+        """Windows 経路でも一時ファイルへ ACL を設定・再検証してから配置されることを確認する。"""
         target = tmp_path / "master.key"
         key = b"\x11" * 32
 
@@ -961,6 +979,7 @@ class TestSetPrivatePermissionsWindows:
         assert acl_target.parent == tmp_path
         assert acl_target.name.startswith(".master.key.")
         assert acl_target.name.endswith(".tmp")
+        assert dacl_recorder == [acl_target]
 
     @pytest.mark.skipif(
         not IS_WINDOWS, reason="実際の icacls による ACL 検証は Windows 専用"
@@ -1251,8 +1270,416 @@ class TestWin32Helpers:
         assert icacls.parent == Path(key_manager_module._windows_system_directory())
 
 
+#: Win32 の ACE 種別（ACCESS_ALLOWED / DENIED と、その OBJECT・CALLBACK 版）。
+_ALLOWED, _DENIED, _ALLOWED_OBJECT, _DENIED_OBJECT = 0x00, 0x01, 0x05, 0x06
+_ALLOWED_CALLBACK, _DENIED_CALLBACK = 0x09, 0x0A
+_ALLOWED_CALLBACK_OBJECT, _DENIED_CALLBACK_OBJECT = 0x0B, 0x0C
+_MANDATORY_LABEL = 0x11
+
+#: 許可リストに含まれない一般アカウントの SID（別ユーザー・組み込みグループ）。
+_FOREIGN_SIDS = [
+    "S-1-5-21-1111111111-2222222222-3333333333-1002",  # 別のローカルユーザー
+    "S-1-5-32-545",  # BUILTIN\Users
+    "S-1-5-11",  # Authenticated Users
+    "S-1-1-0",  # Everyone
+]
+
+#: 許可リストに含まれる SID（実行ユーザー・SYSTEM・Administrators・OWNER RIGHTS・Logon SID）。
+_ALLOWLISTED_SIDS = [
+    _FAKE_USER_SID,
+    "S-1-5-18",
+    "S-1-5-32-544",
+    "S-1-3-4",
+    "S-1-5-5-0-123456",
+]
+
+
+class _FakeDaclWin32:
+    """DACL の取得・走査に使う `advapi32` / `kernel32` の偽実装。
+
+    `aces` で指定した (ACE 種別, SID 文字列) の並びを実メモリ上の ACL・ACE として
+    構築し、`GetNamedSecurityInfoW` / `GetAce` / `ConvertSidToStringSidW` の
+    出力引数（`byref`）へ実際のアドレスを書き込む。これにより Windows 以外でも
+    構造体の解釈・解放処理・各失敗経路を検証できる。
+    """
+
+    DESCRIPTOR = 0xD0D0
+
+    def __init__(
+        self,
+        aces: list[tuple[int, str]],
+        *,
+        status: int = 0,
+        null_dacl: bool = False,
+        failing_ace_index: int | None = None,
+        null_ace_index: int | None = None,
+        convert_sid: bool = True,
+    ) -> None:
+        self.security_info_calls: list[tuple[object, ...]] = []
+        self.converted_sids: list[int] = []
+        self.freed_pointers: list[int | None] = []
+        self._keep_alive: list[ctypes.Array[ctypes.c_wchar]] = []
+        self._acl = key_manager_module._AclHeader(AclRevision=2, AceCount=len(aces))
+        self._ace_buffers: list[ctypes.Array[ctypes.c_char]] = []
+        self._sid_by_address: dict[int, str] = {}
+        for ace_type, sid in aces:
+            buffer = ctypes.create_string_buffer(
+                16
+            )  # ACE_HEADER + ACCESS_MASK + SID領域
+            header = key_manager_module._AceHeader.from_buffer(buffer)
+            header.AceType = ace_type
+            header.AceSize = len(buffer)
+            self._ace_buffers.append(buffer)
+            self._sid_by_address[ctypes.addressof(buffer) + 8] = sid
+
+        def get_named_security_info(
+            name: str,
+            object_type: int,
+            information: int,
+            owner: object,
+            group: object,
+            dacl: Any,
+            sacl: object,
+            descriptor: Any,
+        ) -> int:
+            self.security_info_calls.append(
+                (name, object_type, information, owner, group, sacl)
+            )
+            if status:
+                return status
+            dacl._obj.value = None if null_dacl else ctypes.addressof(self._acl)
+            descriptor._obj.value = self.DESCRIPTOR
+            return 0
+
+        def get_ace(acl: object, index: int, ace: Any) -> int:
+            if index == failing_ace_index:
+                return 0
+            if index == null_ace_index:
+                ace._obj.value = None
+                return 1
+            ace._obj.value = ctypes.addressof(self._ace_buffers[index])
+            return 1
+
+        def convert_sid_to_string_sid(sid: int, string_sid: Any) -> int:
+            self.converted_sids.append(sid)
+            if not convert_sid:
+                return 0
+            text = ctypes.create_unicode_buffer(self._sid_by_address[sid])
+            self._keep_alive.append(text)
+            string_sid._obj.value = ctypes.addressof(text)
+            return 1
+
+        def local_free(pointer: ctypes.c_void_p) -> None:
+            self.freed_pointers.append(pointer.value)
+
+        self.advapi32 = SimpleNamespace(
+            GetNamedSecurityInfoW=get_named_security_info,
+            GetAce=get_ace,
+            ConvertSidToStringSidW=convert_sid_to_string_sid,
+        )
+        self.kernel32 = SimpleNamespace(LocalFree=local_free)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`_load_windows_library` を本偽実装へ差し替える。"""
+        libraries = {"advapi32": self.advapi32, "kernel32": self.kernel32}
+        monkeypatch.setattr(
+            key_manager_module, "_load_windows_library", libraries.__getitem__
+        )
+
+
+class TestGrantingAceSids:
+    """_granting_ace_sids（Win32 API による DACL の走査）に関するテスト。"""
+
+    def test_returns_sids_of_granting_aces_and_skips_deny_aces(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """許可 ACE（通常・CALLBACK）の SID を順に返し、拒否 ACE は読み飛ばすことを確認する。"""
+        fake = _FakeDaclWin32(
+            [
+                (_ALLOWED, _FAKE_USER_SID),
+                (_DENIED, "S-1-1-0"),
+                (_DENIED_OBJECT, "S-1-5-32-545"),
+                (_ALLOWED_CALLBACK, "S-1-5-18"),
+                (_DENIED_CALLBACK, "S-1-5-11"),
+                (_DENIED_CALLBACK_OBJECT, "S-1-5-32-546"),
+            ]
+        )
+        fake.install(monkeypatch)
+        target = tmp_path / "master.key"
+
+        sids = key_manager_module._granting_ace_sids(target)
+
+        assert sids == [_FAKE_USER_SID, "S-1-5-18"]
+        # SE_FILE_OBJECT(1) / DACL_SECURITY_INFORMATION(4) で DACL のみを要求する。
+        assert fake.security_info_calls == [(str(target), 1, 4, None, None, None)]
+        assert len(fake.converted_sids) == 2
+        # SID 文字列 2 件と、最後にセキュリティ記述子を解放する。
+        assert len(fake.freed_pointers) == 3
+        assert fake.freed_pointers[-1] == _FakeDaclWin32.DESCRIPTOR
+
+    def test_empty_dacl_returns_no_sids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ACE を持たない DACL（誰にも許可しない）では空の一覧を返すことを確認する。"""
+        fake = _FakeDaclWin32([])
+        fake.install(monkeypatch)
+
+        assert key_manager_module._granting_ace_sids(tmp_path / "master.key") == []
+        assert fake.freed_pointers == [_FakeDaclWin32.DESCRIPTOR]
+
+    def test_security_info_failure_raises_without_freeing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GetNamedSecurityInfoW の失敗で OSError となり、未取得の記述子を解放しないことを確認する。"""
+        fake = _FakeDaclWin32([(_ALLOWED, _FAKE_USER_SID)], status=5)
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._granting_ace_sids(tmp_path / "master.key")
+        assert fake.freed_pointers == []
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"null_dacl": True},
+            {"failing_ace_index": 1},
+            {"null_ace_index": 0},
+            {"convert_sid": False},
+        ],
+        ids=["null-dacl", "get-ace", "null-ace", "convert-sid"],
+    )
+    def test_unverifiable_dacl_raises_and_frees_descriptor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        options: dict[str, Any],
+    ) -> None:
+        """NULL DACL・ACE 取得失敗・SID 変換失敗は OSError となり、記述子を解放することを確認する。"""
+        fake = _FakeDaclWin32(
+            [(_ALLOWED, _FAKE_USER_SID), (_ALLOWED, "S-1-5-18")], **options
+        )
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._granting_ace_sids(tmp_path / "master.key")
+        assert fake.freed_pointers[-1] == _FakeDaclWin32.DESCRIPTOR
+
+    @pytest.mark.parametrize(
+        "ace_type",
+        [_ALLOWED_OBJECT, _ALLOWED_CALLBACK_OBJECT, _MANDATORY_LABEL],
+    )
+    def test_unsupported_ace_type_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ace_type: int
+    ) -> None:
+        """SID の位置を解釈できない ACE 種別は、許可を見逃さないよう OSError とすることを確認する。"""
+        fake = _FakeDaclWin32([(_ALLOWED, _FAKE_USER_SID), (ace_type, "S-1-1-0")])
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._granting_ace_sids(tmp_path / "master.key")
+        assert fake.freed_pointers[-1] == _FakeDaclWin32.DESCRIPTOR
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による DACL 検証は Windows 専用"
+    )
+    def test_real_dacl_after_icacls_grants_current_user(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """実環境で icacls 適用後のファイルから、実行ユーザーの許可 ACE が読み取れることを確認する。"""
+        target = tmp_path / "master.key"
+        target.write_bytes(b"")
+        key_manager.set_private_permissions(target)
+
+        assert _whoami_user_sid() in key_manager_module._granting_ace_sids(target)
+
+
+class TestVerifyWindowsDacl:
+    """verify_windows_dacl（DACL 許可リスト再検証）に関するテスト。"""
+
+    @staticmethod
+    def _stub_granted(monkeypatch: pytest.MonkeyPatch, sids: list[str]) -> None:
+        monkeypatch.setattr(key_manager_module, "_granting_ace_sids", lambda path: sids)
+
+    def test_accepts_allowlisted_sids(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+    ) -> None:
+        """実行ユーザー・SYSTEM・Administrators・OWNER RIGHTS・Logon SID のみなら通過することを確認する。"""
+        self._stub_granted(monkeypatch, _ALLOWLISTED_SIDS)
+
+        key_manager.verify_windows_dacl(tmp_path / "master.key")
+
+    @pytest.mark.parametrize("foreign_sid", _FOREIGN_SIDS)
+    def test_rejects_granting_ace_for_unapproved_account(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        foreign_sid: str,
+    ) -> None:
+        """許可リスト外のアカウントへの許可 ACE が 1 つでもあれば KeyStorageError となることを確認する。"""
+        self._stub_granted(monkeypatch, [*_ALLOWLISTED_SIDS, foreign_sid])
+        target = tmp_path / "master.key"
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.verify_windows_dacl(target)
+
+        assert excinfo.value.exit_code == 1
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert excinfo.value.context == {"path": str(target)}
+        assert foreign_sid not in repr(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "failing_helper", ["_granting_ace_sids", "_current_user_sid"]
+    )
+    def test_unverifiable_dacl_raises_without_details(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        failing_helper: str,
+    ) -> None:
+        """DACL またはユーザー SID を取得できない場合も中断し、失敗詳細を例外に残さないことを確認する。"""
+        monkeypatch.setattr(key_manager_module, failing_helper, _raise_os_error)
+        target = tmp_path / "master.key"
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.verify_windows_dacl(target)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert excinfo.value.context == {"path": str(target)}
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による DACL 検証は Windows 専用"
+    )
+    def test_real_dacl_after_icacls_passes(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """実環境で icacls を適用したファイルは再検証を通過することを確認する。"""
+        target = tmp_path / "master.key"
+        target.write_bytes(b"")
+        key_manager.set_private_permissions(target)
+
+        key_manager.verify_windows_dacl(target)
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による DACL 検証は Windows 専用"
+    )
+    def test_real_unapproved_explicit_ace_is_rejected(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """icacls 適用前に追加された他アカウントの明示 ACE が残った場合、実環境で拒否されることを確認する。
+
+        `/inheritance:r /grant:r` は指定 SID 以外の明示 ACE を除去しないため、
+        BUILTIN\\Guests（S-1-5-32-546）の明示 ACE が残存することを再現する。
+        """
+        target = tmp_path / "master.key"
+        target.write_bytes(b"")
+        subprocess.run(
+            [
+                KeyManager._icacls_executable(),
+                str(target),
+                "/grant",
+                "*S-1-5-32-546:(R)",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        key_manager.set_private_permissions(target)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.verify_windows_dacl(target)
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による DACL 検証は Windows 専用"
+    )
+    def test_real_missing_file_is_rejected(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """実環境で DACL を取得できない（ファイルが無い）場合に KeyStorageError となることを確認する。"""
+        with pytest.raises(KeyStorageError):
+            key_manager.verify_windows_dacl(tmp_path / "missing.key")
+
+
 class TestSafeAtomicWrite:
     """_store_key による安全な不可分書き込みとフェイルセーフに関するテスト。"""
+
+    def test_dacl_is_verified_after_icacls_and_before_writing(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """Windows では icacls 適用後・鍵の書き込み前（空の一時ファイル）に DACL を再検証することを確認する。"""
+        target = tmp_path / "master.key"
+        observed: list[tuple[Path, int, int]] = []
+
+        def _record(path: Path) -> list[str]:
+            observed.append((path, path.stat().st_size, len(run_recorder.calls)))
+            return [_FAKE_USER_SID]
+
+        monkeypatch.setattr(key_manager_module, "_granting_ace_sids", _record)
+
+        key_manager.create_key_file(target, key=b"\x33" * 32)
+
+        assert len(observed) == 1
+        temp_path, size_at_call, icacls_calls_before = observed[0]
+        assert temp_path == Path(run_recorder.calls[0][0][1])
+        assert size_at_call == 0
+        assert icacls_calls_before == 1
+        assert target.read_bytes() == b"\x33" * 32
+
+    def test_unapproved_ace_aborts_without_touching_existing_key(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """許可リスト外の ACE を検出したら鍵を書かずに中断し、既存鍵と一時ファイルを残さないことを確認する。"""
+        target = tmp_path / "master.key"
+        original = b"\x01" * 32
+        target.write_bytes(original)
+        monkeypatch.setattr(
+            key_manager_module,
+            "_granting_ace_sids",
+            lambda path: [_FAKE_USER_SID, "S-1-5-32-545"],
+        )
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.create_key_file(target, key=b"\x02" * 32)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        # 利用者には一時ファイル名ではなく保存先パスを示す。
+        assert excinfo.value.context == {"path": str(target)}
+        assert target.read_bytes() == original
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_dacl_is_not_verified_on_unix(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_unix: None,
+    ) -> None:
+        """Unix 系では DACL 再検証を行わない（chmod 0600 のみ）ことを確認する。"""
+        monkeypatch.setattr(KeyManager, "verify_windows_dacl", _raise_os_error)
+        target = tmp_path / "master.key"
+
+        key_manager.create_key_file(target, key=b"\x44" * 32)
+
+        assert target.read_bytes() == b"\x44" * 32
 
     def test_permissions_are_set_on_empty_temp_file_before_writing(
         self,
@@ -1512,6 +1939,190 @@ class TestRotateKeyFileFailSafe:
             key_manager.rotate_key_file(target, b"\x09" * 32)
 
         assert not list(tmp_path.glob("*.tmp"))
+
+
+#: 最古世代の退避ファイル名（`<key_path>.3.<16桁の16進数>.old`）。
+_PARKED_OLDEST_NAME = re.compile(r"master\.key\.3\.[0-9a-f]{16}\.old")
+
+
+class TestRotateKeyFileOldestGenerationProtection:
+    """上限到達時（`.3` が存在する場合）の最古世代の退避とロールバックに関するテスト。"""
+
+    @staticmethod
+    def _seed_full_generations(target: Path) -> dict[Path, bytes]:
+        """正式鍵と `.1`〜`.3` をすべて作成し、パスと内容の対応を返す。"""
+        contents = {
+            target: b"\x00" * 32,
+            Path(f"{target}.1"): b"\x01" * 32,
+            Path(f"{target}.2"): b"\x02" * 32,
+            Path(f"{target}.3"): b"\x03" * 32,
+        }
+        for path, data in contents.items():
+            path.write_bytes(data)
+        return contents
+
+    @staticmethod
+    def _fail_replace_when(
+        monkeypatch: pytest.MonkeyPatch, should_fail: Any
+    ) -> list[tuple[str, str]]:
+        """`should_fail(source, destination)` が真となる os.replace だけを失敗させる。"""
+        real_replace = os.replace
+        calls: list[tuple[str, str]] = []
+
+        def _replace(source: Path, destination: Path) -> None:
+            calls.append((str(source), str(destination)))
+            if should_fail(str(source), str(destination)):
+                raise OSError("simulated replace failure")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", _replace)
+        return calls
+
+    def test_successful_rotation_parks_then_discards_oldest(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`.3` を退避してから繰り上げ、配置成功後に退避ファイルが残らないことを確認する。"""
+        target = tmp_path / "master.key"
+        self._seed_full_generations(target)
+        calls = self._fail_replace_when(monkeypatch, lambda source, dest: False)
+
+        key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        parked_source, parked_destination = calls[0]
+        assert parked_source == f"{target}.3"
+        assert _PARKED_OLDEST_NAME.fullmatch(Path(parked_destination).name)
+        assert [source for source, _ in calls[1:]][:3] == [
+            f"{target}.2",
+            f"{target}.1",
+            str(target),
+        ]
+        assert target.read_bytes() == b"\x09" * 32
+        assert Path(f"{target}.1").read_bytes() == b"\x00" * 32
+        assert Path(f"{target}.2").read_bytes() == b"\x01" * 32
+        assert Path(f"{target}.3").read_bytes() == b"\x02" * 32
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "master.key",
+            "master.key.1",
+            "master.key.2",
+            "master.key.3",
+        ]
+
+    def test_final_replace_failure_restores_parked_oldest_generation(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """4 回目以降のローテーションで新鍵の配置に失敗した場合、`.3` を含む全世代が元に戻ることを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_full_generations(target)
+        self._fail_replace_when(
+            monkeypatch, lambda source, dest: source.endswith(".tmp")
+        )
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert excinfo.value.exit_code == 1
+        assert excinfo.value.message_key is MsgKey.KEY_STORAGE_FAILED
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert sorted(tmp_path.iterdir()) == sorted(contents)
+
+    @pytest.mark.parametrize("failing_source", [".2", ".1", ""])
+    def test_shift_failure_restores_parked_oldest_generation(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failing_source: str,
+    ) -> None:
+        """途中の世代繰り上げに失敗した場合も、退避した `.3` を含めて元に戻ることを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_full_generations(target)
+        failing_path = f"{target}{failing_source}"
+        self._fail_replace_when(
+            monkeypatch, lambda source, dest: source == failing_path
+        )
+
+        with pytest.raises(KeyStorageError):
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert sorted(tmp_path.iterdir()) == sorted(contents)
+
+    def test_parking_failure_leaves_generations_untouched(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`.3` の退避自体に失敗した場合、何も移動せずに中断することを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_full_generations(target)
+        calls = self._fail_replace_when(
+            monkeypatch, lambda source, dest: dest.endswith(".old")
+        )
+
+        with pytest.raises(KeyStorageError):
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert len(calls) == 1
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert sorted(tmp_path.iterdir()) == sorted(contents)
+
+    def test_parked_file_deletion_failure_is_ignored(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """配置成功後の退避ファイル削除に失敗しても、例外を送出せずローテーションが完了することを確認する。"""
+        target = tmp_path / "master.key"
+        self._seed_full_generations(target)
+        real_unlink = Path.unlink
+
+        def _unlink(self: Path, missing_ok: bool = False) -> None:
+            if self.name.endswith(".old"):
+                raise OSError("simulated unlink failure")
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", _unlink)
+
+        key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert target.read_bytes() == b"\x09" * 32
+        assert Path(f"{target}.3").read_bytes() == b"\x02" * 32
+        leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".old")]
+        assert len(leftovers) == 1
+        assert _PARKED_OLDEST_NAME.fullmatch(leftovers[0].name)
+        assert leftovers[0].read_bytes() == b"\x03" * 32
+
+    def test_dacl_rejection_leaves_all_generations_untouched(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+        run_recorder: _RunRecorder,
+    ) -> None:
+        """Windows の DACL 再検証で拒否された場合、`.3` を含む全世代を一切移動しないことを確認する。"""
+        target = tmp_path / "master.key"
+        contents = self._seed_full_generations(target)
+        monkeypatch.setattr(
+            key_manager_module,
+            "_granting_ace_sids",
+            lambda path: [_FAKE_USER_SID, "S-1-1-0"],
+        )
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+        assert {p: p.read_bytes() for p in contents} == contents
+        assert sorted(tmp_path.iterdir()) == sorted(contents)
 
 
 def secrets_like_key() -> bytes:
