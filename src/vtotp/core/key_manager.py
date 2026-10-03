@@ -15,7 +15,7 @@ import secrets
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from vtotp.domain.exceptions import (
     InvalidKeyError,
@@ -35,6 +35,12 @@ _TOKEN_QUERY: int = 0x0008
 
 #: `GetTokenInformation` の情報クラス `TokenUser`。
 _TOKEN_USER_CLASS: int = 1
+
+#: `GetTokenInformation` の情報クラス `TokenGroups`。
+_TOKEN_GROUPS_CLASS: int = 2
+
+#: ログオンセッション SID を表すグループ属性 `SE_GROUP_LOGON_ID`。
+_SE_GROUP_LOGON_ID: int = 0xC0000000
 
 #: `GetSystemDirectoryW` に渡すバッファの文字数（拡張パス長の上限）。
 _SYSTEM_DIRECTORY_BUFFER_CHARS: int = 32768
@@ -77,6 +83,18 @@ class _AceHeader(ctypes.Structure):
         ("AceFlags", ctypes.c_uint8),
         ("AceSize", ctypes.c_uint16),
     ]
+
+
+class _SidAndAttributes(ctypes.Structure):
+    """Win32 の `SID_AND_ATTRIBUTES` 構造体。"""
+
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_uint32)]
+
+
+class _TokenGroups(ctypes.Structure):
+    """Win32 の `TOKEN_GROUPS` 構造体（`Groups` は可変長配列の先頭要素）。"""
+
+    _fields_ = [("GroupCount", ctypes.c_uint32), ("Groups", _SidAndAttributes * 1)]
 
 
 def _load_windows_library(name: str) -> Any:
@@ -135,13 +153,39 @@ def _sid_to_string(advapi32: Any, kernel32: Any, sid: int | None) -> str:
         kernel32.LocalFree(string_sid)
 
 
-def _current_user_sid() -> str:
-    """現在のプロセストークンからユーザー SID（`S-1-5-21-...` 形式）を返す。
+def _token_user_sid_pointers(buffer: ctypes.Array[ctypes.c_char]) -> list[int | None]:
+    """`TOKEN_USER` からユーザー SID のポインタを取り出す。
 
-    環境変数や `getpass.getuser()` には依存せず、`OpenProcessToken` と
-    `GetTokenInformation(TokenUser)` で取得した SID を
-    `ConvertSidToStringSidW` で文字列化する。トークンハンドルと文字列 SID の
-    領域は必ず解放する。取得に失敗した場合は :class:`OSError` を送出する。
+    `TOKEN_USER` は `SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }` で
+    始まるため、先頭のポインタ値がユーザー SID を指す。
+    """
+    return [ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]]
+
+
+def _token_logon_sid_pointers(buffer: ctypes.Array[ctypes.c_char]) -> list[int | None]:
+    """`TOKEN_GROUPS` から `SE_GROUP_LOGON_ID` 属性を持つグループ SID のポインタを取り出す。"""
+    header = _TokenGroups.from_buffer(buffer)
+    groups = ctypes.cast(
+        ctypes.addressof(buffer) + _TokenGroups.Groups.offset,
+        ctypes.POINTER(_SidAndAttributes),
+    )
+    return [
+        groups[index].Sid
+        for index in range(header.GroupCount)
+        if groups[index].Attributes & _SE_GROUP_LOGON_ID == _SE_GROUP_LOGON_ID
+    ]
+
+
+def _token_sids(
+    info_class: int,
+    select_sids: Callable[[ctypes.Array[ctypes.c_char]], list[int | None]],
+) -> list[str]:
+    """現在のプロセストークンの情報クラス `info_class` から SID を文字列で返す。
+
+    `OpenProcessToken` と `GetTokenInformation` で取得したバッファから
+    `select_sids` が選んだ SID を `ConvertSidToStringSidW` で文字列化する。
+    トークンハンドルと文字列 SID の領域は必ず解放する。取得に失敗した場合は
+    :class:`OSError` を送出する。
     """
     advapi32 = _load_windows_library("advapi32")
     kernel32 = _load_windows_library("kernel32")
@@ -171,30 +215,48 @@ def _current_user_sid() -> str:
     ):
         raise OSError("OpenProcessToken failed")
     try:
-        # 1回目の呼び出しで TOKEN_USER に必要なバッファサイズを取得する
+        # 1回目の呼び出しで必要なバッファサイズを取得する
         # （この呼び出し自体はバッファ不足で失敗するのが正常）。
         required_size = ctypes.c_uint32(0)
         advapi32.GetTokenInformation(
-            token, _TOKEN_USER_CLASS, None, 0, ctypes.byref(required_size)
+            token, info_class, None, 0, ctypes.byref(required_size)
         )
         if required_size.value == 0:
-            raise OSError("GetTokenInformation(TokenUser) returned no size")
-        token_user = ctypes.create_string_buffer(required_size.value)
+            raise OSError("GetTokenInformation returned no size")
+        information = ctypes.create_string_buffer(required_size.value)
         if not advapi32.GetTokenInformation(
             token,
-            _TOKEN_USER_CLASS,
-            token_user,
+            info_class,
+            information,
             required_size.value,
             ctypes.byref(required_size),
         ):
-            raise OSError("GetTokenInformation(TokenUser) failed")
+            raise OSError("GetTokenInformation failed")
 
-        # TOKEN_USER は SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; } で
-        # 始まるため、先頭のポインタ値がユーザー SID を指す。
-        user_sid = ctypes.cast(token_user, ctypes.POINTER(ctypes.c_void_p))[0]
-        return _sid_to_string(advapi32, kernel32, user_sid)
+        return [
+            _sid_to_string(advapi32, kernel32, sid) for sid in select_sids(information)
+        ]
     finally:
         kernel32.CloseHandle(token)
+
+
+def _current_user_sid() -> str:
+    """現在のプロセストークンからユーザー SID（`S-1-5-21-...` 形式）を返す。
+
+    環境変数や `getpass.getuser()` には依存せず、`GetTokenInformation(TokenUser)`
+    で取得した SID を使う。取得に失敗した場合は :class:`OSError` を送出する。
+    """
+    return _token_sids(_TOKEN_USER_CLASS, _token_user_sid_pointers)[0]
+
+
+def _current_logon_sids() -> frozenset[str]:
+    """現在のプロセスに紐づくログオンセッション SID（`S-1-5-5-X-Y` 形式）を返す。
+
+    `GetTokenInformation(TokenGroups)` のグループのうち、属性に
+    `SE_GROUP_LOGON_ID` を持つものだけを抽出する。他のセッションの Logon SID は
+    含まない。取得に失敗した場合は :class:`OSError` を送出する。
+    """
+    return frozenset(_token_sids(_TOKEN_GROUPS_CLASS, _token_logon_sid_pointers))
 
 
 def _granting_ace_sids(path: Path) -> list[str]:
@@ -287,14 +349,12 @@ class KeyManager:
     #: Dが無いと `os.replace` による配置・世代繰り上げ・一時ファイル削除が失敗する。
     WINDOWS_PRIVATE_GRANT: str = "(R,W,D)"
 
-    #: DACL 再検証で、実行ユーザー以外に許可 ACE の残存を認める既知の SID
-    #: （`SYSTEM` / `Administrators` / `OWNER RIGHTS`。REQUIREMENTS.md 4.1 の注記）。
+    #: DACL 再検証で、実行ユーザーと現在の Logon SID 以外に許可 ACE の残存を
+    #: 認める既知の SID（`SYSTEM` / `Administrators` / `OWNER RIGHTS`。
+    #: REQUIREMENTS.md 4.1 の注記）。
     WINDOWS_ALLOWED_WELL_KNOWN_SIDS: frozenset[str] = frozenset(
         {"S-1-5-18", "S-1-5-32-544", "S-1-3-4"}
     )
-
-    #: DACL 再検証で許可 ACE の残存を認めるログオンセッション SID の接頭辞。
-    WINDOWS_LOGON_SID_PREFIX: str = "S-1-5-5-"
 
     def generate_key(self) -> bytes:
         """暗号学的に安全な32バイト鍵を生成する。"""
@@ -440,26 +500,28 @@ class KeyManager:
         """Windowsで `path` の DACL を許可リストと照合する（DESIGN.md 6章）。
 
         アクセスを許可する ACE の SID が、実行ユーザー（プロセストークンの
-        SID）、:attr:`WINDOWS_ALLOWED_WELL_KNOWN_SIDS`、ログオンセッション SID
-        （:attr:`WINDOWS_LOGON_SID_PREFIX`）のいずれでもない場合は
-        :class:`KeyStorageError` を送出する。拒否 ACE は検証対象外とする。
-        DACL を検証できない場合（Win32 API の失敗等）も同じく中断する。
-        Win32 API の失敗詳細は例外チェーンにも残さない（Zero Leakage Rule）。
+        `TokenUser`）、現在のプロセスに紐づく Logon SID（`TokenGroups` のうち
+        `SE_GROUP_LOGON_ID` 属性を持つもの）、
+        :attr:`WINDOWS_ALLOWED_WELL_KNOWN_SIDS` のいずれとも完全一致しない
+        場合は :class:`KeyStorageError` を送出する（他セッションの Logon SID は
+        拒否する）。拒否 ACE は検証対象外とする。DACL やトークン情報を取得
+        できない場合（Win32 API の失敗等）も同じく中断する。Win32 API の失敗
+        詳細は例外チェーンにも残さない（Zero Leakage Rule）。
         """
         context = {"path": str(path)}
         try:
-            allowed_sids = {_current_user_sid(), *self.WINDOWS_ALLOWED_WELL_KNOWN_SIDS}
+            allowed_sids = {
+                _current_user_sid(),
+                *_current_logon_sids(),
+                *self.WINDOWS_ALLOWED_WELL_KNOWN_SIDS,
+            }
             granted_sids = _granting_ace_sids(path)
         except OSError:
             raise KeyStorageError(
                 MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
             ) from None
 
-        if any(
-            sid not in allowed_sids
-            and not sid.startswith(self.WINDOWS_LOGON_SID_PREFIX)
-            for sid in granted_sids
-        ):
+        if any(sid not in allowed_sids for sid in granted_sids):
             raise KeyStorageError(MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context)
 
     def _ensure_valid_key_size(self, path: Path, key: bytes) -> None:

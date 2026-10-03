@@ -569,18 +569,28 @@ def force_unix(monkeypatch: pytest.MonkeyPatch) -> None:
 #: 偽の Win32 API が返す実行ユーザーの SID。
 _FAKE_USER_SID = "S-1-5-21-1111111111-2222222222-3333333333-1001"
 
+#: 偽の Win32 API が返す、現在のプロセスに紐づく Logon SID。
+_FAKE_LOGON_SID = "S-1-5-5-0-123456"
+
+#: 別のログオンセッション（別 LUID）の Logon SID。
+_OTHER_SESSION_LOGON_SID = "S-1-5-5-0-654321"
+
 
 @pytest.fixture
 def force_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     """実行OSに関わらず、Windowsの権限設定経路を通るようにする。
 
-    System32 とユーザー SID の取得（Win32 API）は固定値を返す偽関数へ差し替える。
+    System32・ユーザー SID・Logon SID の取得（Win32 API）は固定値を返す
+    偽関数へ差し替える。
     """
     monkeypatch.setattr(key_manager_module, "_is_windows", lambda: True)
     monkeypatch.setattr(
         key_manager_module, "_windows_system_directory", lambda: r"C:\Windows\System32"
     )
     monkeypatch.setattr(key_manager_module, "_current_user_sid", lambda: _FAKE_USER_SID)
+    monkeypatch.setattr(
+        key_manager_module, "_current_logon_sids", lambda: frozenset({_FAKE_LOGON_SID})
+    )
 
 
 @pytest.fixture
@@ -648,20 +658,6 @@ def _win32_security_apis() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
-    advapi32.OpenProcessToken.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.GetTokenInformation.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     return advapi32, kernel32
 
@@ -712,65 +708,6 @@ def _file_owner_sid(path: Path) -> str:
         return _sid_to_string(owner)
     finally:
         kernel32.LocalFree(descriptor)
-
-
-class _SidAndAttributes(ctypes.Structure):
-    """Win32 の `SID_AND_ATTRIBUTES` 構造体。"""
-
-    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_uint32)]
-
-
-class _TokenGroups(ctypes.Structure):
-    """Win32 の `TOKEN_GROUPS` 構造体（`Groups` は可変長配列の先頭要素）。"""
-
-    _fields_ = [("GroupCount", ctypes.c_uint32), ("Groups", _SidAndAttributes * 1)]
-
-
-def _current_logon_sids() -> set[str]:
-    """現在のプロセストークンのグループから、ログオンセッション SID を返す（Windows 専用）。
-
-    `GetTokenInformation(TokenGroups)` で取得した `TOKEN_GROUPS` のうち、
-    属性に `SE_GROUP_LOGON_ID` を持つエントリを抽出する。抽出した SID が
-    Logon SID の形式（`S-1-5-5-X-Y`）であることも併せて検証する。
-    """
-    token_query, token_groups_class = 0x0008, 2
-    se_group_logon_id = 0xC0000000
-    advapi32, kernel32 = _win32_security_apis()
-
-    token = ctypes.c_void_p()
-    if not advapi32.OpenProcessToken(
-        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        required_size = ctypes.c_uint32(0)
-        advapi32.GetTokenInformation(
-            token, token_groups_class, None, 0, ctypes.byref(required_size)
-        )
-        buffer = ctypes.create_string_buffer(required_size.value)
-        if not advapi32.GetTokenInformation(
-            token,
-            token_groups_class,
-            buffer,
-            required_size.value,
-            ctypes.byref(required_size),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-    finally:
-        kernel32.CloseHandle(token)
-
-    header = _TokenGroups.from_buffer(buffer)
-    groups = ctypes.cast(
-        ctypes.addressof(buffer) + _TokenGroups.Groups.offset,
-        ctypes.POINTER(_SidAndAttributes),
-    )
-    logon_sids = {
-        _sid_to_string(ctypes.c_void_p(groups[index].Sid))
-        for index in range(header.GroupCount)
-        if groups[index].Attributes & se_group_logon_id == se_group_logon_id
-    }
-    assert all(re.fullmatch(r"S-1-5-5-\d+-\d+", sid) for sid in logon_sids), logon_sids
-    return logon_sids
 
 
 def _raise_os_error(*args: object, **kwargs: object) -> None:
@@ -1039,7 +976,7 @@ class TestSetPrivatePermissionsWindows:
         # SYSTEM, Administrators, OWNER RIGHTS と、現在のセッションの Logon SID のみを
         # 許容する（他セッションの Logon SID は許容対象外として user_aces に残る）。
         allowed_sids = {"S-1-5-18", administrators_sid, "S-1-3-4"}
-        allowed_sids |= _current_logon_sids()
+        allowed_sids |= key_manager_module._current_logon_sids()
         user_aces = [
             [*ace[:5], sid]
             for ace in aces
@@ -1061,6 +998,7 @@ class _FakeWin32:
 
     TOKEN_HANDLE = 0xBEEF
     SID_POINTER = 0x5151
+    GROUP_SID_POINTER_BASE = 0x6000
 
     def __init__(
         self,
@@ -1071,12 +1009,25 @@ class _FakeWin32:
         convert_sid: bool = True,
         system_directory: str = r"C:\Windows\System32",
         system_directory_length: int | None = None,
+        groups: list[tuple[str, int]] | None = None,
+        token_groups_size: int | None = None,
     ) -> None:
         self.closed_handles: list[int | None] = []
         self.freed_pointers: list[int | None] = []
         self.requested_access: list[int] = []
+        self.requested_classes: list[int] = []
         self.converted_sids: list[int] = []
         self._keep_alive: list[ctypes.Array[ctypes.c_wchar]] = []
+        # TokenGroups の各グループ SID は、偽のポインタ値から文字列へ引けるようにする。
+        token_groups = groups or []
+        self._sid_strings = {self.SID_POINTER: _FAKE_USER_SID} | {
+            self.GROUP_SID_POINTER_BASE + index: sid
+            for index, (sid, _) in enumerate(token_groups)
+        }
+        groups_offset = key_manager_module._TokenGroups.Groups.offset
+        entry_size = ctypes.sizeof(key_manager_module._SidAndAttributes)
+        if token_groups_size is None:
+            token_groups_size = groups_offset + entry_size * max(len(token_groups), 1)
 
         def open_process_token(process: object, access: int, token: Any) -> int:
             self.requested_access.append(access)
@@ -1088,20 +1039,35 @@ class _FakeWin32:
         def get_token_information(
             token: object, info_class: int, buffer: Any, length: int, size: Any
         ) -> int:
-            assert info_class == 1  # TokenUser
+            assert info_class in (1, 2)  # TokenUser / TokenGroups
             if buffer is None:
-                size._obj.value = token_user_size
+                self.requested_classes.append(info_class)
+                size._obj.value = (
+                    token_user_size if info_class == 1 else token_groups_size
+                )
                 return 0
             if not token_information:
                 return 0
-            ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0] = self.SID_POINTER
+            if info_class == 1:
+                pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))
+                pointer[0] = self.SID_POINTER
+                return 1
+            header = key_manager_module._TokenGroups.from_buffer(buffer)
+            header.GroupCount = len(token_groups)
+            entries = ctypes.cast(
+                ctypes.addressof(buffer) + groups_offset,
+                ctypes.POINTER(key_manager_module._SidAndAttributes),
+            )
+            for index, (_, attributes) in enumerate(token_groups):
+                entries[index].Sid = self.GROUP_SID_POINTER_BASE + index
+                entries[index].Attributes = attributes
             return 1
 
         def convert_sid_to_string_sid(sid: int, string_sid: Any) -> int:
             self.converted_sids.append(sid)
             if not convert_sid:
                 return 0
-            text = ctypes.create_unicode_buffer(_FAKE_USER_SID)
+            text = ctypes.create_unicode_buffer(self._sid_strings[sid])
             self._keep_alive.append(text)
             string_sid._obj.value = ctypes.addressof(text)
             return 1
@@ -1234,6 +1200,70 @@ class TestWin32Helpers:
         assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
         assert fake.freed_pointers == []
 
+    def test_current_logon_sids_selects_only_logon_id_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TokenGroups のうち SE_GROUP_LOGON_ID 属性を持つ SID だけを返し、資源を解放することを確認する。"""
+        fake = _FakeWin32(
+            groups=[
+                ("S-1-1-0", 0x00000007),  # Everyone（必須・既定で有効）
+                (_FAKE_LOGON_SID, 0xC0000007),  # 現在のセッションの Logon SID
+                ("S-1-5-32-545", 0x00000007),  # BUILTIN\Users
+                ("S-1-5-5-0-999", 0x80000000),  # 属性の一部しか持たないものは除外
+            ]
+        )
+        fake.install(monkeypatch)
+
+        assert key_manager_module._current_logon_sids() == frozenset({_FAKE_LOGON_SID})
+        assert fake.requested_access == [0x0008]  # TOKEN_QUERY
+        assert fake.requested_classes == [2]  # TokenGroups
+        assert fake.converted_sids == [_FakeWin32.GROUP_SID_POINTER_BASE + 1]
+        assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
+        assert len(fake.freed_pointers) == 1
+
+    def test_current_logon_sids_is_empty_without_logon_id_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Logon SID を持たないトークンでは空集合を返す（何も追加で許可しない）ことを確認する。"""
+        fake = _FakeWin32(groups=[("S-1-1-0", 0x00000007)])
+        fake.install(monkeypatch)
+
+        assert key_manager_module._current_logon_sids() == frozenset()
+        assert fake.converted_sids == []
+        assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
+
+    def test_current_logon_sids_open_token_failure_raises_without_closing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenProcessToken が失敗した場合、OSError となり未取得のハンドルを閉じないことを確認する。"""
+        fake = _FakeWin32(open_token=False, groups=[(_FAKE_LOGON_SID, 0xC0000007)])
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._current_logon_sids()
+        assert fake.closed_handles == []
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"token_groups_size": 0},
+            {"token_information": False},
+            {"convert_sid": False},
+        ],
+        ids=["size-query", "token-information", "convert-sid"],
+    )
+    def test_current_logon_sids_query_failures_raise_and_close_handle(
+        self, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+    ) -> None:
+        """TokenGroups の取得・SID 変換の失敗時も OSError となり、トークンハンドルを閉じることを確認する。"""
+        fake = _FakeWin32(groups=[(_FAKE_LOGON_SID, 0xC0000007)], **options)
+        fake.install(monkeypatch)
+
+        with pytest.raises(OSError):
+            key_manager_module._current_logon_sids()
+        assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
+        assert fake.freed_pointers == []
+
     @pytest.mark.skipif(
         not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
     )
@@ -1245,7 +1275,7 @@ class TestWin32Helpers:
         not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
     )
     def test_real_logon_sids_match_whoami_logonid(self) -> None:
-        """TokenGroups から抽出したログオンセッション SID が whoami /logonid の結果と一致することを確認する。
+        """_current_logon_sids の結果が whoami /logonid と一致することを確認する。
 
         `whoami /groups` は Logon SID を列挙しないため、SID のみを出力する
         `whoami /logonid` を独立した照合元として用いる。
@@ -1257,7 +1287,9 @@ class TestWin32Helpers:
             capture_output=True,
             text=True,
         )
-        assert _current_logon_sids() == {result.stdout.strip()}
+        logon_sids = key_manager_module._current_logon_sids()
+        assert logon_sids == {result.stdout.strip()}
+        assert all(re.fullmatch(r"S-1-5-5-\d+-\d+", sid) for sid in logon_sids)
 
     @pytest.mark.skipif(
         not IS_WINDOWS, reason="実際の Win32 API による検証は Windows 専用"
@@ -1276,21 +1308,23 @@ _ALLOWED_CALLBACK, _DENIED_CALLBACK = 0x09, 0x0A
 _ALLOWED_CALLBACK_OBJECT, _DENIED_CALLBACK_OBJECT = 0x0B, 0x0C
 _MANDATORY_LABEL = 0x11
 
-#: 許可リストに含まれない一般アカウントの SID（別ユーザー・組み込みグループ）。
+#: 許可リストに含まれない SID（別ユーザー・組み込みグループ・別セッションの Logon SID）。
 _FOREIGN_SIDS = [
     "S-1-5-21-1111111111-2222222222-3333333333-1002",  # 別のローカルユーザー
     "S-1-5-32-545",  # BUILTIN\Users
     "S-1-5-11",  # Authenticated Users
     "S-1-1-0",  # Everyone
+    _OTHER_SESSION_LOGON_SID,  # 別のログオンセッション（別 LUID）
 ]
 
-#: 許可リストに含まれる SID（実行ユーザー・SYSTEM・Administrators・OWNER RIGHTS・Logon SID）。
+#: 許可リストに含まれる SID（実行ユーザー・SYSTEM・Administrators・OWNER RIGHTS・
+#: 現在のプロセスの Logon SID）。
 _ALLOWLISTED_SIDS = [
     _FAKE_USER_SID,
     "S-1-5-18",
     "S-1-5-32-544",
     "S-1-3-4",
-    "S-1-5-5-0-123456",
+    _FAKE_LOGON_SID,
 ]
 
 
@@ -1533,8 +1567,39 @@ class TestVerifyWindowsDacl:
         assert excinfo.value.context == {"path": str(target)}
         assert foreign_sid not in repr(excinfo.value)
 
+    def test_logon_sid_must_match_current_process_exactly(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+    ) -> None:
+        """Logon SID は接頭辞ではなく、現在のプロセスの Logon SID との完全一致で判定することを確認する。"""
+        target = tmp_path / "master.key"
+        self._stub_granted(monkeypatch, [_FAKE_USER_SID, _FAKE_LOGON_SID])
+        key_manager.verify_windows_dacl(target)
+
+        self._stub_granted(monkeypatch, [_FAKE_USER_SID, _OTHER_SESSION_LOGON_SID])
+        with pytest.raises(KeyStorageError):
+            key_manager.verify_windows_dacl(target)
+
+    def test_logon_sid_ace_is_rejected_when_token_has_no_logon_sid(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        force_windows: None,
+    ) -> None:
+        """トークンに Logon SID が無い場合、どの Logon SID の許可 ACE も拒否することを確認する。"""
+        monkeypatch.setattr(key_manager_module, "_current_logon_sids", frozenset)
+        self._stub_granted(monkeypatch, [_FAKE_USER_SID, _FAKE_LOGON_SID])
+
+        with pytest.raises(KeyStorageError):
+            key_manager.verify_windows_dacl(tmp_path / "master.key")
+
     @pytest.mark.parametrize(
-        "failing_helper", ["_granting_ace_sids", "_current_user_sid"]
+        "failing_helper",
+        ["_granting_ace_sids", "_current_user_sid", "_current_logon_sids"],
     )
     def test_unverifiable_dacl_raises_without_details(
         self,
@@ -1597,6 +1662,36 @@ class TestVerifyWindowsDacl:
         with pytest.raises(KeyStorageError) as excinfo:
             key_manager.verify_windows_dacl(target)
         assert excinfo.value.message_key is MsgKey.KEY_PERMISSION_SETUP_FAILED
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS, reason="実際の Win32 API による DACL 検証は Windows 専用"
+    )
+    def test_real_logon_sid_ace_is_checked_against_current_session(
+        self, key_manager: KeyManager, tmp_path: Path
+    ) -> None:
+        """実環境で、現在のセッションの Logon SID の明示 ACE は許可し、別セッションのものは拒否することを確認する。"""
+        icacls = KeyManager._icacls_executable()
+        (current_logon_sid,) = key_manager_module._current_logon_sids()
+        luid_high, luid_low = current_logon_sid.rsplit("-", 2)[1:]
+        other_logon_sid = f"S-1-5-5-{luid_high}-{int(luid_low) + 1}"
+
+        for logon_sid, accepted in [
+            (current_logon_sid, True),
+            (other_logon_sid, False),
+        ]:
+            target = tmp_path / f"{accepted}.key"
+            target.write_bytes(b"")
+            key_manager.set_private_permissions(target)
+            subprocess.run(
+                [icacls, str(target), "/grant", f"*{logon_sid}:(R)"],
+                check=True,
+                capture_output=True,
+            )
+            if accepted:
+                key_manager.verify_windows_dacl(target)
+            else:
+                with pytest.raises(KeyStorageError):
+                    key_manager.verify_windows_dacl(target)
 
     @pytest.mark.skipif(
         not IS_WINDOWS, reason="実際の Win32 API による DACL 検証は Windows 専用"
