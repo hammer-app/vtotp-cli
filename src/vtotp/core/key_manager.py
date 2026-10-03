@@ -51,9 +51,10 @@ _SE_FILE_OBJECT: int = 1
 #: `GetNamedSecurityInfoW` で DACL を要求する `DACL_SECURITY_INFORMATION`。
 _DACL_SECURITY_INFORMATION: int = 0x00000004
 
-#: アクセスを許可する ACE 種別のうち、SID がヘッダーとアクセスマスクの直後に
-#: 続く形式（`ACCESS_ALLOWED_ACE` / `ACCESS_ALLOWED_CALLBACK_ACE`）。
-_ACCESS_ALLOWED_ACE_TYPES: frozenset[int] = frozenset({0x00, 0x09})
+#: SID を照合する許可 ACE 種別（通常形式の `ACCESS_ALLOWED_ACE` のみ。SID が
+#: ヘッダーとアクセスマスクの直後に続く）。CALLBACK・OBJECT 形式など、これ以外の
+#: 許可 ACE は DESIGN.md 6章に従い未解釈として拒否する（フェイルクローズ）。
+_ACCESS_ALLOWED_ACE_TYPES: frozenset[int] = frozenset({0x00})
 
 #: アクセスを拒否する ACE 種別（`ACCESS_DENIED_ACE` と、その OBJECT /
 #: CALLBACK / CALLBACK_OBJECT 版）。許可を与えないため再検証の対象外とする。
@@ -163,8 +164,14 @@ def _token_user_sid_pointers(buffer: ctypes.Array[ctypes.c_char]) -> list[int | 
 
 
 def _token_logon_sid_pointers(buffer: ctypes.Array[ctypes.c_char]) -> list[int | None]:
-    """`TOKEN_GROUPS` から `SE_GROUP_LOGON_ID` 属性を持つグループ SID のポインタを取り出す。"""
-    header = _TokenGroups.from_buffer(buffer)
+    """`TOKEN_GROUPS` から `SE_GROUP_LOGON_ID` 属性を持つグループ SID のポインタを取り出す。
+
+    グループが 0 件のトークンでは、バッファが `_TokenGroups` 構造体（配列要素
+    1 件分を含む）より小さくなり得る。`from_buffer` はサイズ不足で
+    :class:`ValueError` を送出するため、サイズ検査を伴わない `cast` で
+    先頭の `GroupCount` だけを読み取る。
+    """
+    header = ctypes.cast(buffer, ctypes.POINTER(_TokenGroups)).contents
     groups = ctypes.cast(
         ctypes.addressof(buffer) + _TokenGroups.Groups.offset,
         ctypes.POINTER(_SidAndAttributes),

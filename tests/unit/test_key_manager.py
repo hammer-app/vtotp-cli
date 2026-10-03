@@ -1052,7 +1052,11 @@ class _FakeWin32:
                 pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))
                 pointer[0] = self.SID_POINTER
                 return 1
-            header = key_manager_module._TokenGroups.from_buffer(buffer)
+            # 実際の OS と同じく、グループ 0 件ならヘッダー分だけのバッファも扱えるよう
+            # サイズ検査を伴わない cast で書き込む。
+            header = ctypes.cast(
+                buffer, ctypes.POINTER(key_manager_module._TokenGroups)
+            ).contents
             header.GroupCount = len(token_groups)
             entries = ctypes.cast(
                 ctypes.addressof(buffer) + groups_offset,
@@ -1220,6 +1224,27 @@ class TestWin32Helpers:
         assert fake.converted_sids == [_FakeWin32.GROUP_SID_POINTER_BASE + 1]
         assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
         assert len(fake.freed_pointers) == 1
+
+    def test_token_logon_sid_pointers_accepts_header_only_buffer(self) -> None:
+        """グループ 0 件でヘッダー分しかない（構造体より小さい）バッファでも ValueError にならないことを確認する。"""
+        header_only_size = key_manager_module._TokenGroups.Groups.offset
+        assert header_only_size < ctypes.sizeof(key_manager_module._TokenGroups)
+        buffer = ctypes.create_string_buffer(header_only_size)  # GroupCount = 0
+
+        assert key_manager_module._token_logon_sid_pointers(buffer) == []
+
+    def test_current_logon_sids_with_zero_groups_returns_empty_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GetTokenInformation がヘッダー分のサイズだけを返すグループ 0 件のトークンでも、空集合を返すことを確認する。"""
+        fake = _FakeWin32(
+            groups=[], token_groups_size=key_manager_module._TokenGroups.Groups.offset
+        )
+        fake.install(monkeypatch)
+
+        assert key_manager_module._current_logon_sids() == frozenset()
+        assert fake.converted_sids == []
+        assert fake.closed_handles == [_FakeWin32.TOKEN_HANDLE]
 
     def test_current_logon_sids_is_empty_without_logon_id_group(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1427,13 +1452,13 @@ class TestGrantingAceSids:
     def test_returns_sids_of_granting_aces_and_skips_deny_aces(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """許可 ACE（通常・CALLBACK）の SID を順に返し、拒否 ACE は読み飛ばすことを確認する。"""
+        """通常形式の許可 ACE の SID を順に返し、拒否 ACE（全 4 形式）は読み飛ばすことを確認する。"""
         fake = _FakeDaclWin32(
             [
                 (_ALLOWED, _FAKE_USER_SID),
                 (_DENIED, "S-1-1-0"),
                 (_DENIED_OBJECT, "S-1-5-32-545"),
-                (_ALLOWED_CALLBACK, "S-1-5-18"),
+                (_ALLOWED, "S-1-5-18"),
                 (_DENIED_CALLBACK, "S-1-5-11"),
                 (_DENIED_CALLBACK_OBJECT, "S-1-5-32-546"),
             ]
@@ -1500,13 +1525,28 @@ class TestGrantingAceSids:
 
     @pytest.mark.parametrize(
         "ace_type",
-        [_ALLOWED_OBJECT, _ALLOWED_CALLBACK_OBJECT, _MANDATORY_LABEL],
+        [
+            _ALLOWED_CALLBACK,
+            _ALLOWED_OBJECT,
+            _ALLOWED_CALLBACK_OBJECT,
+            _MANDATORY_LABEL,
+        ],
+        ids=["allowed-callback", "allowed-object", "allowed-callback-object", "label"],
     )
+    @pytest.mark.parametrize("granted_sid", [_FAKE_USER_SID, "S-1-1-0"])
     def test_unsupported_ace_type_fails_closed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ace_type: int
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        ace_type: int,
+        granted_sid: str,
     ) -> None:
-        """SID の位置を解釈できない ACE 種別は、許可を見逃さないよう OSError とすることを確認する。"""
-        fake = _FakeDaclWin32([(_ALLOWED, _FAKE_USER_SID), (ace_type, "S-1-1-0")])
+        """通常形式以外の ACE 種別は、SID が許可リスト内であっても未解釈として OSError とすることを確認する。
+
+        DESIGN.md 6章に従い、CALLBACK・OBJECT 形式などの許可 ACE は SID を
+        照合せずに拒否する（フェイルクローズ）。
+        """
+        fake = _FakeDaclWin32([(_ALLOWED, _FAKE_USER_SID), (ace_type, granted_sid)])
         fake.install(monkeypatch)
 
         with pytest.raises(OSError):
