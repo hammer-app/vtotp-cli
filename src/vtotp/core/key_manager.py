@@ -591,7 +591,10 @@ class KeyManager:
         世代繰り上げでは、既存の最古世代を同一ディレクトリの退避ファイル
         （`<key_path>.3.<hex>.old`）へ移してから繰り上げる。退避・繰り上げ
         または配置が失敗した場合は、実施済みの移動を逆順に戻してから元の
-        例外を再送出する。退避ファイルは配置が成功した場合にのみ削除する。
+        例外を再送出する。逆移動が1つでも失敗した場合は、その時点で復元を
+        打ち切る（後続の逆移動が、戻せなかった鍵の残る移動先を上書きして鍵を
+        失うのを防ぐため、残りの世代・退避ファイルはそのまま保全する）。
+        退避ファイルは配置が成功した場合にのみ削除する。
         """
         completed_moves: list[tuple[Path, Path]] = []
         parked_oldest: Path | None = None
@@ -611,9 +614,13 @@ class KeyManager:
             os.replace(temp_path, path)
         except OSError:
             for source, destination in reversed(completed_moves):
-                # 復旧は最善努力で行い、元の失敗原因を優先して送出する。
-                with contextlib.suppress(OSError):
+                try:
                     os.replace(destination, source)
+                except OSError:
+                    # 戻せなかった鍵は destination に残っている。ここで続行すると
+                    # 次の逆移動がその destination を上書きして鍵を失うため中断する。
+                    # 元の失敗原因を優先して送出する。
+                    break
             raise
 
         if parked_oldest is not None:

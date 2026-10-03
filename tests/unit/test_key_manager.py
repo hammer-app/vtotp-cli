@@ -2188,6 +2188,92 @@ class TestRotateKeyFileOldestGenerationProtection:
         assert {p: p.read_bytes() for p in contents} == contents
         assert sorted(tmp_path.iterdir()) == sorted(contents)
 
+    @pytest.mark.parametrize(
+        "failing_reverse_move",
+        [
+            ("", ".1"),  # .1 -> master.key（現在の鍵の復元）
+            (".1", ".2"),  # .2 -> .1
+            (".2", ".3"),  # .3 -> .2
+            (".3", ".old"),  # 退避ファイル -> .3
+        ],
+        ids=["active-key", "generation-1", "generation-2", "parked-oldest"],
+    )
+    def test_rollback_stops_at_first_failed_reverse_move_without_losing_keys(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failing_reverse_move: tuple[str, str],
+    ) -> None:
+        """ロールバックの逆移動が失敗したら即座に中断し、どの世代の鍵も上書きで失われないことを確認する。
+
+        例えば `.1 -> master.key` の復元に失敗した場合、`.1` には現在の鍵が
+        残っている。ここで続行すると次の `.2 -> .1` が現在の鍵を上書きして
+        永久に失うため、以降の逆移動は一切行わない。送出される例外は、元の
+        配置失敗を原因として保持する。
+        """
+        target = tmp_path / "master.key"
+        contents = self._seed_full_generations(target)
+        restore_to, restore_from = failing_reverse_move
+        real_replace = os.replace
+        calls: list[tuple[str, str]] = []
+
+        def _is_failing_reverse_move(source: str, destination: str) -> bool:
+            if destination != f"{target}{restore_to}":
+                return False
+            if restore_from == ".old":
+                return _PARKED_OLDEST_NAME.fullmatch(Path(source).name) is not None
+            return source == f"{target}{restore_from}"
+
+        def _replace(source: Path, destination: Path) -> None:
+            calls.append((str(source), str(destination)))
+            if str(source).endswith(".tmp"):
+                raise OSError("simulated placement failure")
+            if _is_failing_reverse_move(str(source), str(destination)):
+                raise OSError("simulated rollback failure")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", _replace)
+
+        with pytest.raises(KeyStorageError) as excinfo:
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert excinfo.value.message_key is MsgKey.KEY_STORAGE_FAILED
+        assert str(excinfo.value.__cause__) == "simulated placement failure"
+        # 失敗した逆移動が最後の os.replace 呼び出しであり、以降は何も移動しない。
+        assert _is_failing_reverse_move(*calls[-1])
+        # 4 世代すべての鍵が、いずれかのファイルにそれぞれ 1 つずつ残っている。
+        surviving = sorted(p.read_bytes() for p in tmp_path.iterdir())
+        assert surviving == sorted(contents.values())
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_rollback_failure_on_active_key_keeps_it_in_generation_one(
+        self,
+        key_manager: KeyManager,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`.1 -> master.key` の復元に失敗した場合、現在の鍵が `.1` に残り、`.2 -> .1` が実行されないことを確認する。"""
+        target = tmp_path / "master.key"
+        self._seed_full_generations(target)
+        calls = self._fail_replace_when(
+            monkeypatch,
+            lambda source, dest: source.endswith(".tmp")
+            or (source == f"{target}.1" and dest == str(target)),
+        )
+
+        with pytest.raises(KeyStorageError):
+            key_manager.rotate_key_file(target, b"\x09" * 32)
+
+        assert (f"{target}.2", f"{target}.1") not in calls
+        assert not target.exists()
+        assert Path(f"{target}.1").read_bytes() == b"\x00" * 32  # 現在の鍵
+        assert Path(f"{target}.2").read_bytes() == b"\x01" * 32
+        assert Path(f"{target}.3").read_bytes() == b"\x02" * 32
+        parked = [p for p in tmp_path.iterdir() if p.name.endswith(".old")]
+        assert len(parked) == 1
+        assert parked[0].read_bytes() == b"\x03" * 32
+
     def test_parking_failure_leaves_generations_untouched(
         self,
         key_manager: KeyManager,
