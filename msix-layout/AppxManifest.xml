@@ -10,7 +10,7 @@
   <!-- Publisher is a placeholder: replace with the Publisher ID shown in Partner Center. -->
   <Identity
       Name="ToramimiNetwork.vtotp"
-      Publisher="CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+      Publisher="CN=C0059302-D542-4E94-87E4-38A69465DEC6"
       Version="0.3.1.0" />
 
   <Properties>
