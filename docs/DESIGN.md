@@ -1642,8 +1642,9 @@ DACL 保護（Section 6）、ならびに OS 標準の資格情報ストア（Wi
 
 インストール後にユーザーによる手動 PATH 設定なしで、ターミナルから `vtotp` および
 `vtotp.exe` のコマンド名で直接起動できるよう、
-`desktop4:Extension Category="windows.appExecutionAlias"` 配下に `vtotp.exe` を指す
-実行エイリアスを定義する。
+`uap5:Extension Category="windows.appExecutionAlias"` 配下に `vtotp.exe` を指す
+実行エイリアスを定義する。コンソールアプリケーションとして正しくターミナルへ接続される
+よう、`desktop4:Subsystem="console"` を `uap5:AppExecutionAlias` の属性として指定する。
 
 ```xml
 <Applications>
@@ -1655,13 +1656,11 @@ DACL 保護（Section 6）、ならびに OS 標準の資格情報ストア（Wi
         Square44x44Logo="Assets\Square44x44Logo.png"
         BackgroundColor="transparent" />
     <Extensions>
-      <desktop4:Extension Category="windows.appExecutionAlias"
-                          Executable="vtotp.exe"
-                          EntryPoint="Windows.FullTrustApplication">
-        <desktop4:AppExecutionAlias>
-          <desktop4:ExecutionAlias Alias="vtotp.exe" />
-        </desktop4:AppExecutionAlias>
-      </desktop4:Extension>
+      <uap5:Extension Category="windows.appExecutionAlias" Executable="vtotp.exe" EntryPoint="Windows.FullTrustApplication">
+        <uap5:AppExecutionAlias desktop4:Subsystem="console">
+          <uap5:ExecutionAlias Alias="vtotp.exe" />
+        </uap5:AppExecutionAlias>
+      </uap5:Extension>
     </Extensions>
   </Application>
 </Applications>
@@ -1672,18 +1671,35 @@ DACL 保護（Section 6）、ならびに OS 標準の資格情報ストア（Wi
 コマンド呼び出し名の透過性要件）。エイリアス反映のため、インストール後に新しく開いた
 ターミナルからの起動を検証基準とする。
 
+#### Dependencies
+
+`Properties` と `Resources` の間に、必須要素 `<Dependencies>` を配置し、ターゲット OS
+バージョンを次のように定義する。
+
+```xml
+<Dependencies>
+  <TargetDeviceFamily MaxVersionTested="10.0.26100.0" MinVersion="10.0.17763.0" Name="Windows.Desktop"/>
+</Dependencies>
+```
+
+`MinVersion="10.0.17763.0"`（Windows 10 バージョン 1809）以上を対象とし、AppExecutionAlias
+および runFullTrust が安定して利用可能な Desktop ファミリのみをサポート対象とする。
+`MaxVersionTested` は動作検証済みの最新 OS ビルド（Windows 11 24H2 相当の
+`10.0.26100.0`）を指定する。
+
 #### マニフェスト名前空間
 
 `runFullTrust` と AppExecutionAlias を使用するため、ルート要素で次の名前空間を宣言し、
-`IgnorableNamespaces` に含める。
+`IgnorableNamespaces` に含める。AppExecutionAlias が属する `uap5` 名前空間も必須である。
 
 ```xml
 <Package
     xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
     xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
     xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
     xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
-    IgnorableNamespaces="uap rescap desktop4">
+    IgnorableNamespaces="uap uap5 rescap desktop4">
 ```
 
 ### 25.4 署名・配布フロー

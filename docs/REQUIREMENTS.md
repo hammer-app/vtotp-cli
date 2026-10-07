@@ -208,7 +208,7 @@
        * コマンドラインからの迅速な導入・更新を可能にするため、Microsoft Store 配布と連動した winget（`winget install ...`）を通じた配布・連携にも対応すること。
    * **実行・CLI 透過性要件 (AppExecutionAlias):**
      * MSIX パッケージとしてインストールされた後、ターミナル（PowerShell、コマンドプロンプト、Windows Terminal 等）から、ユーザーによる手動 PATH 設定を不要とし、`vtotp` および `vtotp.exe` のコマンド名で透過的かつ等価に直接実行可能であること。
-     * これを実現するため、MSIX マニフェスト（`AppxManifest.xml`）において `desktop:ExecutionAlias`（`AppExecutionAlias`）を適切に定義すること。
+     * これを実現するため、MSIX マニフェスト（`AppxManifest.xml`）において `uap5:AppExecutionAlias` / `uap5:ExecutionAlias` を適切に定義すること。
    * **権限・アクセス要件 (runFullTrust):**
      * ローカルキーチェーン（Windows Credential Manager）へのアクセス、および設定ファイルや暗号化データ（`~/.vtotp/` 等のユーザープロファイル領域）の永続化とファイルパーミッション保護（DACL）を正常に維持すること。
      * UWP 標準サンドボックスによるファイルシステムおよびレジストリの仮想化（VFS リダイレクト）の影響を回避し、ネイティブ実行環境と完全に同一のファイル・権限アクセスを担保するため、制限付き権限（`runFullTrust` 相当）を必須とすること。
