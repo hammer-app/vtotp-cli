@@ -64,3 +64,5 @@ msix-layout/*
 !msix-layout/AppxManifest.xml
 !msix-layout/Assets/
 !msix-layout/Assets/*
+msix-layout/Assets/Thumbs.db
+msix-layout/Assets/.DS_Store

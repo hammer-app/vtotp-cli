@@ -66,17 +66,22 @@ MSIX 版は、Nuitka の Standalone 成果物を MSIX レイアウトディレ�
 
 #### パッケージ作成手順
 
+マニフェストとロゴ資産はリポジトリ内の `msix-layout/`（`AppxManifest.xml`、`Assets/`）として管理済みです。このディレクトリに Nuitka Standalone 成果物を配置してからパッケージ化します。
+
 1. 手順 1 と同じ Nuitka コマンドで Standalone 版をビルドします（`--onefile` は付けません）
-2. MSIX レイアウトディレクトリを作成し、以下を配置します
-   - パッケージルートに `AppxManifest.xml` と `Assets/`（StoreLogo 等のロゴ資産）
-   - Standalone 成果物一式（`vtotp.exe` および依存 DLL / Python ランタイム）をパッケージルートへ
+2. Standalone 成果物一式（`vtotp.exe` および依存 DLL / Python ランタイム）を `msix-layout/` 直下へコピーします
+
+    ```powershell
+    Copy-Item .\dist\standalone\__main__.dist\* .\msix-layout\ -Recurse -Force
+    ```
+
 3. `makeappx pack` でパッケージ化します
 
 ```powershell
-makeappx pack /d <layout_dir> /p dist\vtotp_<VERSION>_x64.msix /nv
+makeappx pack /d .\msix-layout /p .\dist\vtotp_<VERSION>_x64.msix
 ```
 
-`/d` はレイアウトディレクトリ、`/p` は出力 `.msix` パス、`/nv` はパッケージ化時のセマンティック検証スキップを指定します。生成された `.msix` は無署名のため、ローカル検証を行う場合は次章の自己署名手順を、ストア公開時は無署名のまま Partner Center へ提出します（署名はストア審査時に自動付与されます）。
+`/d` はレイアウトディレクトリ、`/p` は出力 `.msix` パスを指定します。パッケージ内容のセマンティック検証は有効なままとし、マニフェスト不備を早期に検知できるようにします。生成された `.msix` は無署名のため、ローカル検証を行う場合は次章の自己署名手順を、ストア公開時は無署名のまま Partner Center へ提出します（署名はストア審査時に自動付与されます）。
 
 ## MSIX のローカル自己署名・インストール検証
 
@@ -90,7 +95,7 @@ makeappx pack /d <layout_dir> /p dist\vtotp_<VERSION>_x64.msix /nv
 # Publisher は AppxManifest.xml の Identity/@Publisher と完全一致させる
 $cert = New-SelfSignedCertificate `
     -Type Custom `
-    -Subject "CN=<AppxManifest.xml の Publisher 値>" `
+    -Subject "<AppxManifest.xml の Publisher 値（CN=...）>" `
     -KeyUsage DigitalSignature `
     -FriendlyName "vtotp MSIX Dev Cert" `
     -CertStoreLocation "Cert:\CurrentUser\My" `

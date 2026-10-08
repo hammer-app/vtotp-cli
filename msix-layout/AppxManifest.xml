@@ -7,11 +7,11 @@
     xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
     IgnorableNamespaces="uap uap5 rescap desktop4">
 
-  <!-- Publisher is a placeholder: replace with the Publisher ID shown in Partner Center. -->
   <Identity
       Name="ToramimiNetwork.vtotp"
       Publisher="CN=C0059302-D542-4E94-87E4-38A69465DEC6"
-      Version="0.3.1.0" />
+      Version="0.3.1.0"
+      ProcessorArchitecture="x64" />
 
   <Properties>
     <DisplayName>vtotp</DisplayName>

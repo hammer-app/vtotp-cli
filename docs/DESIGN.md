@@ -1620,7 +1620,8 @@ Onefile 版は実行時の自己展開が MSIX の読み取り専用インスト
 | --- | --- | --- |
 | `Name` | `ToramimiNetwork.vtotp` | Partner Center で予約したパッケージ名 |
 | `Publisher` | Partner Center の Publisher ID に準拠（形式例: `CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`） | 提出時は Partner Center ポータルの表示値と完全一致させる。ローカル検証用の自己署名証明書もこの CN に合わせて発行する |
-| `Version` | `0.3.1.0` ベース | PE メタデータ規則（Section 22.1）と同じ数値 4 区切り形式。ストア提出ごとにリビジョンをインクリメントする |
+| `Version` | `X.Y.Z.0` 形式 | PE メタデータ規則（Section 22.1）と同じ数値 4 区切り形式。第 4 要素（リビジョン）はストア予約のため常に `0` 固定とし、ストア再提出時は第 3 要素（Build）をインクリメントする |
+| `ProcessorArchitecture` | `x64` | 64 ビット x86 を対象とする。ビルド成果物（Standalone x64 バイナリ）と一致させる |
 
 #### Capabilities（runFullTrust）
 
