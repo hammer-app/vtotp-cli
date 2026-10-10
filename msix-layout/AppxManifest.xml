@@ -32,7 +32,8 @@
   </Capabilities>
 
   <Applications>
-    <Application Id="vtotp" Executable="vtotp.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="vtotp" Executable="vtotp.exe"
+     EntryPoint="Windows.FullTrustApplication" desktop4:SupportsMultipleInstances="true">
       <uap:VisualElements
           DisplayName="vtotp"
           Description="Custom CLI TOTP Authenticator"
