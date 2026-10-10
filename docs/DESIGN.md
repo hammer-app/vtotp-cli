@@ -1721,7 +1721,7 @@ DACL 保護（Section 6）、ならびに OS 標準の資格情報ストア（Wi
 ### 25.5 設計上の完了条件
 
 ```text
-- AppxManifest.xml が Identity（ToramimiNetwork.vtotp / Publisher ID / 0.3.1.0 ベース）、
+- AppxManifest.xml が Identity（ToramimiNetwork.vtotp / Publisher ID / X.Y.Z.0 形式 / x64）、
     runFullTrust、AppExecutionAlias を正しく宣言している
 - パッケージルートに vtotp.exe、依存ファイル一式、Assets/ が欠落なく配置される
 - インストール後に新規ターミナルから `vtotp` / `vtotp.exe` の双方で起動できる
