@@ -26,6 +26,9 @@ It physically separates the master key from encrypted data, ensures plaintext se
 - **Tamper-resistant native binaries**: distributed binaries are built with **Nuitka**, which transpiles the Python source into C-equivalent code and compiles it to native machine code, rather than bundling Python bytecode the way PyInstaller does. This makes recovering the original source with a typical Python bytecode decompiler impractical, giving the binary real tamper resistance.
 - **Microsoft Store & winget official distribution**: Ships as a Store-signed MSIX package that eliminates Windows 11 Smart App Control (SAC) and SmartScreen unsigned binary warnings. Integrated with Windows execution aliases (`AppExecutionAlias`), making the `vtotp` command globally available from any terminal immediately after installation without manual `PATH` setup.
 
+  > **Note**
+  > Currently undergoing Microsoft Store submission. Installation via winget and the Microsoft Store will become available once certified.
+
 ---
 
 ## Requirements

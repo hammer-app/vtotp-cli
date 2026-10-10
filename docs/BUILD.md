@@ -73,7 +73,7 @@ MSIX 版は、Nuitka の Standalone 成果物を MSIX レイアウトディレ�
 
     ```powershell
     # マニフェストとロゴ資産以外をクリーンアップ
-    Get-ChildItem .\msix-layout -Exclude "AppxManifest.xml", "Assets" | Remove-Item -Recurse -Force
+    Get-ChildItem .\msix-layout\* -Exclude "AppxManifest.xml", "Assets" | Remove-Item -Recurse -Force
 
     # 新しい成果物をコピー
     Copy-Item .\dist\standalone\__main__.dist\* .\msix-layout\ -Recurse -Force
