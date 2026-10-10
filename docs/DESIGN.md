@@ -1577,3 +1577,155 @@ checkout -> setup-python -> pip install -e ".[build]"
 第一引数固定、`config` 言語更新、`MsgKey` + context方式に置き換える。鍵パス・ストレージ
 パスの解決優先順位、AES-256-GCM、atomic保存、終了コード、Zero Leakage Ruleは既存章を
 引き続き適用する。
+
+## 25. MSIX パッケージング・ストア配布設計
+
+### 25.1 背景と目的
+
+Issue #31（v0.3.1）では、Windows SmartScreen の未署名警告および Windows 11 SAC
+（スマートアプリコントロール）による未署名実行ブロックを根本的に回避するため、
+Microsoft Store 経由の MSIX パッケージ配布へ対応する（要件: REQUIREMENTS.md 4.4-7）。
+開発者自身による商用コード署名証明書（EV/OV）の調達・管理は行わず、Microsoft Store の
+提出・審査プロセスによる自動コード署名（ストア自動署名）を利用する。MSIX 版は Nuitka の
+Standalone 成果物をパッケージ化したものであり、実行時の自己展開オーバーヘッドがなく、
+起動速度と配布信頼性を両立する Windows 推奨形態とする。あわせて winget 経由の導入経路も
+ストア配布と連動して提供する。
+
+### 25.2 MSIX パッケージレイアウト
+
+MSIX パッケージは次のディレクトリレイアウトを単一のレイアウトディレクトリへ構成し、
+`makeappx pack` で一括パッケージ化する。
+
+```text
+msix-layout/
+├── AppxManifest.xml              # パッケージマニフェスト（25.3 参照）
+├── Assets/                       # ストア・シェル表示用ロゴ資産
+│   ├── StoreLogo.png
+│   ├── Square44x44Logo.png
+│   └── Square150x150Logo.png
+├── vtotp.exe                     # Nuitka Standalone 版の実行ファイル
+└── <依存 DLL / Python ランタイム一式>   # Standalone 成果物の残りすべて
+```
+
+`vtotp.exe` および依存ファイルは、Section 18.2 の Standalone ビルド（`--standalone`、
+`--onefile` なし）が出力するディレクトリの内容をそのままパッケージルートへ配置する。
+Onefile 版は実行時の自己展開が MSIX の読み取り専用インストール領域と相性が悪く起動
+オーバーヘッドも残るため、MSIX 版のベースには使用しない。
+
+### 25.3 AppxManifest.xml コア仕様
+
+#### Identity
+
+| 属性 | 値 | 備考 |
+| --- | --- | --- |
+| `Name` | `ToramimiNetwork.vtotp` | Partner Center で予約したパッケージ名 |
+| `Publisher` | Partner Center の Publisher ID に準拠（形式例: `CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`） | 提出時は Partner Center ポータルの表示値と完全一致させる。ローカル検証用の自己署名証明書もこの CN に合わせて発行する |
+| `Version` | `X.Y.Z.0` 形式 | PE メタデータ規則（Section 22.1）と同じ数値 4 区切り形式。第 4 要素（リビジョン）はストア予約のため常に `0` 固定とし、ストア再提出時は第 3 要素（Build）をインクリメントする |
+| `ProcessorArchitecture` | `x64` | 64 ビット x86 を対象とする。ビルド成果物（Standalone x64 バイナリ）と一致させる |
+
+#### Capabilities（runFullTrust）
+
+`REQUIREMENTS.md` のファイル仮想化回避要件を満たすため、UWP 標準サンドボックスによる
+ファイルシステム・レジストリの仮想化（VFS リダイレクト）を無効化し、ネイティブ実行時と
+完全に同一のファイル・権限アクセスを許可する制限付き権限 `runFullTrust` を必須宣言とする。
+
+```xml
+<Capabilities>
+  <rescap:Capability Name="runFullTrust" />
+</Capabilities>
+```
+
+これにより、`~/.vtotp/` 配下の設定ファイル・暗号化データおよび外部鍵ファイルへの永続化と
+DACL 保護（Section 6）、ならびに OS 標準の資格情報ストア（Windows Credential Manager）への
+アクセスが、VFS リダイレクトなしでネイティブ実行と等価に動作する。
+
+#### Extensions（AppExecutionAlias）
+
+インストール後にユーザーによる手動 PATH 設定なしで、ターミナルから `vtotp` および
+`vtotp.exe` のコマンド名で直接起動できるよう、
+`uap5:Extension Category="windows.appExecutionAlias"` 配下に `vtotp.exe` を指す
+実行エイリアスを定義する。コンソールアプリケーションとして正しくターミナルへ接続される
+よう、`desktop4:Subsystem="console"` を `uap5:AppExecutionAlias` の属性として指定する。
+
+```xml
+<Applications>
+  <Application Id="vtotp" Executable="vtotp.exe" EntryPoint="Windows.FullTrustApplication">
+    <uap:VisualElements
+        DisplayName="vtotp"
+        Description="Custom CLI TOTP Authenticator"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        BackgroundColor="transparent" />
+    <Extensions>
+      <uap5:Extension Category="windows.appExecutionAlias" Executable="vtotp.exe" EntryPoint="Windows.FullTrustApplication">
+        <uap5:AppExecutionAlias desktop4:Subsystem="console">
+          <uap5:ExecutionAlias Alias="vtotp.exe" />
+        </uap5:AppExecutionAlias>
+      </uap5:Extension>
+    </Extensions>
+  </Application>
+</Applications>
+```
+
+`Alias="vtotp.exe"` を宣言すると、Windows のエイリアス解決により拡張子なしの `vtotp`
+でも `vtotp.exe` でも同一バイナリが透過的かつ等価に起動される（REQUIREMENTS.md 5.1-4 の
+コマンド呼び出し名の透過性要件）。エイリアス反映のため、インストール後に新しく開いた
+ターミナルからの起動を検証基準とする。
+
+#### Dependencies
+
+`Properties` と `Resources` の間に、必須要素 `<Dependencies>` を配置し、ターゲット OS
+バージョンを次のように定義する。
+
+```xml
+<Dependencies>
+  <TargetDeviceFamily MaxVersionTested="10.0.26100.0" MinVersion="10.0.17763.0" Name="Windows.Desktop"/>
+</Dependencies>
+```
+
+`MinVersion="10.0.17763.0"`（Windows 10 バージョン 1809）以上を対象とし、AppExecutionAlias
+および runFullTrust が安定して利用可能な Desktop ファミリのみをサポート対象とする。
+`MaxVersionTested` は動作検証済みの最新 OS ビルド（Windows 11 24H2 相当の
+`10.0.26100.0`）を指定する。
+
+#### マニフェスト名前空間
+
+`runFullTrust` と AppExecutionAlias を使用するため、ルート要素で次の名前空間を宣言し、
+`IgnorableNamespaces` に含める。AppExecutionAlias が属する `uap5` 名前空間も必須である。
+
+```xml
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+    IgnorableNamespaces="uap uap5 rescap desktop4">
+```
+
+### 25.4 署名・配布フロー
+
+```text
+1. Nuitka Standalone ビルド（BUILD.md ビルド手順 1）
+2. 25.2 のレイアウトディレクトリへ成果物・AppxManifest.xml・Assets/ を配置
+3. makeappx pack で .msix を生成
+4. ローカル検証: 自己署名証明書で signtool 署名 → Add-AppxPackage → 起動確認
+   （詳細は BUILD.md の MSIX 検証手順）
+5. リリース: 人間が Partner Center へ .msix を提出
+6. ストア審査通過後、Microsoft による自動コード署名が付与されて公開
+```
+
+リリース用パッケージに開発者自身が署名する必要はない。`signtool` による署名はローカル
+検証専用であり、ストア提出用の成果物は無署名のまま提出する。
+
+### 25.5 設計上の完了条件
+
+```text
+- AppxManifest.xml が Identity（ToramimiNetwork.vtotp / Publisher ID / X.Y.Z.0 形式 / x64）、
+    runFullTrust、AppExecutionAlias を正しく宣言している
+- パッケージルートに vtotp.exe、依存ファイル一式、Assets/ が欠落なく配置される
+- インストール後に新規ターミナルから `vtotp` / `vtotp.exe` の双方で起動できる
+- MSIX 環境でも init / generate / add / list / rekey がネイティブ実行と等価に動作し、
+    ファイル仮想化による ~/.vtotp/ へのリダイレクトが発生しない
+- SmartScreen / SAC の警告・ブロックなしにインストール・実行できる（ストア署名後）
+```

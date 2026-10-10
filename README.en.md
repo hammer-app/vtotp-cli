@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD033 -->
 # vtotp
 
 English | [日本語](README.md)
@@ -23,6 +24,10 @@ It physically separates the master key from encrypted data, ensures plaintext se
   - The most common operation — generating a code — doesn't need a subcommand at all (`vtotp <service>` is enough).
   - Master key rotation keeps up to 3 automatic generations of backups.
 - **Tamper-resistant native binaries**: distributed binaries are built with **Nuitka**, which transpiles the Python source into C-equivalent code and compiles it to native machine code, rather than bundling Python bytecode the way PyInstaller does. This makes recovering the original source with a typical Python bytecode decompiler impractical, giving the binary real tamper resistance.
+- **Microsoft Store & winget official distribution**: Ships as a Store-signed MSIX package that eliminates Windows 11 Smart App Control (SAC) and SmartScreen unsigned binary warnings. Integrated with Windows execution aliases (`AppExecutionAlias`), making the `vtotp` command globally available from any terminal immediately after installation without manual `PATH` setup.
+
+  > **Note**
+  > Currently undergoing Microsoft Store submission. Installation via winget and the Microsoft Store will become available once certified.
 
 ---
 
@@ -35,15 +40,32 @@ It physically separates the master key from encrypted data, ensures plaintext se
 
 ## Installation and Distribution Formats
 
-vtotp ships in **three distribution formats**, so you can pick the one that fits your environment and workflow. All three behave identically (Zero Leakage, encryption, exit codes, etc.) — only the startup characteristics differ.
+vtotp ships in **four distribution formats**, allowing you to choose the best option for your environment and workflow. All formats provide identical functionality (Zero Leakage, encryption, exit codes, etc.) — they differ primarily in installation method, startup performance, and security signing characteristics. For daily use on Windows, the **Store Edition (MSIX / winget)** is recommended for a seamless, warning-free experience without manual `PATH` setup.
 
-| Format | Artifact | Startup speed | Security characteristics | Recommended for |
+| Format | Artifact / Install Method | Startup Speed | Security & Signing Characteristics | Recommended For |
 | --- | --- | --- | --- | --- |
-| ① **Standalone ZIP** (recommended) | `vtotp-windows-x64.zip` (a folder of files) | **Instant** (no perceptible lag; no extraction happens at runtime) | Doesn't drop files into a temp folder at runtime, so it's the least likely to trigger AV heuristics | Users who call `vtotp` from a terminal all day and want it on `PATH` for the fastest possible startup |
-| ② **Onefile EXE** | `vtotp.exe` (a single file) | Extraction overhead (startup delay due to runtime extraction or security scanning) | Extracts DLLs to a temp folder at runtime, so it's more exposed to AV scanning/detection | Users who want a single `.exe` they can drop on a USB drive or into any folder, with no `PATH` setup or unpacking |
-| ③ **Source install** (Python package) | `pip install -e .` | Normal (standard Python runtime startup) | Depends on the OS's own Python runtime | Linux/macOS users, and developers who want to read or modify the code directly |
+| ① **Store Edition**<br>(Recommended for Windows) | Microsoft Store<br>`winget install vtotp` | **Instant**<br>(~0.05–0.1s, no runtime extraction) | **No SmartScreen / SAC warnings**<br>(Store automatic code signing) | **All Windows users**.<br>Zero security warnings, zero manual `PATH` setup, seamless terminal integration |
+| ② **Standalone ZIP** | `vtotp-windows-x64.zip`<br>(folder bundle) | **Instant**<br>(~0.05–0.1s, no runtime extraction) | Low AV heuristic risk (no temp dropping); may require manual override on unsigned runs | Environments where Microsoft Store is unavailable, or power users who prefer manual folder placement & `PATH` setup |
+| ③ **Onefile EXE** | `vtotp.exe`<br>(single binary) | Extraction overhead<br>(delay from runtime unpack & AV scan) | Drops DLLs to temp folder at runtime; more susceptible to AV scanning delays | Portable use (e.g., USB drive) where you want a single `.exe` file without unpacking |
+| ④ **Source install**<br>(Python package) | `pip install -e .` | Normal<br>(standard Python runtime startup) | Depends on the OS's own Python runtime | Linux/macOS users, and developers who want to inspect or modify the code directly |
 
-### ① Standalone ZIP (recommended, fastest)
+### ① Store Edition (MSIX / winget: Recommended for Windows)
+
+The easiest, safest, and officially recommended installation method on Windows.
+
+- **Microsoft Store**: One-click install and automatic background updates via the Microsoft Store.
+- **winget (Windows Package Manager)**: Install with a single command from your terminal:
+
+```powershell
+# Install via winget
+winget install vtotp
+```
+
+> **Transparent CLI Execution (No PATH Setup Required)**:
+> Upon installation, Windows App Execution Alias (`AppExecutionAlias`) automatically makes `vtotp` and `vtotp.exe` globally available in any terminal (PowerShell, Command Prompt, Windows Terminal) without modifying your `PATH` environment variable.
+> Furthermore, with Microsoft Store's automatic code signature, you will never see Windows SmartScreen warnings or Windows 11 Smart App Control (SAC) execution blocks.
+
+### ② Standalone ZIP (Fast & Portable Everyday Use)
 
 Download `vtotp-windows-x64.zip` from [GitHub Releases](https://github.com/hammer-app/vtotp-cli/releases) and extract it to any folder.
 
@@ -57,7 +79,7 @@ C:\Tools\vtotp\vtotp.exe --version
 
 The folder contains `vtotp.exe` plus its dependent DLLs and the Python runtime. Because nothing is extracted at runtime, this starts instantly and is the lowest-risk way to run vtotp.
 
-### ② Onefile EXE (portable, single file)
+### ③ Onefile EXE (Portable, Single File)
 
 Download the single-file `vtotp.exe` from the same [Releases page](https://github.com/hammer-app/vtotp-cli/releases) and place it in any folder — no extraction needed.
 
@@ -68,9 +90,9 @@ C:\Tools\vtotp\vtotp.exe --version
 
 Runs, especially when intercepted by a security product's scan, may take a moment to self-extract, but there's no folder to manage or install step — just one portable file.
 
-Neither format requires pip or a virtual environment. Everywhere the quickstart below shows `vtotp`, you can substitute `vtotp.exe`.
+Neither binary format requires pip or a virtual environment. Everywhere the quickstart below shows `vtotp`, you can substitute `vtotp.exe`.
 
-### ③ Source install (Python / pip)
+### ④ Source install (Python / pip)
 
 Create a virtual environment and install in editable or normal mode.
 
