@@ -3,11 +3,12 @@
 Custom CLI TOTP Authenticator built in Python.
 Refer to `docs/REQUIREMENTS.md` for functional requirements and `docs/DESIGN.md` for detailed architectural design specs.
 
-## Operational Rules & Behavioral Guidelines
+## Operational Rules & Behavioral Guidelines (For Claude Code ONLY)
 
-- **No Direct Document Modification:**
-  - Do not directly edit or commit documentation files (`docs/REQUIREMENTS.md`, `docs/DESIGN.md`, `README.*`, `SECURITY.md`, etc.).
+- **No Direct Document Modification (Claude Code strictly prohibited):**
+  - Claude Code MUST NOT directly edit or commit documentation files (`docs/REQUIREMENTS.md`, `docs/DESIGN.md`, `README.*`, `SECURITY.md`, etc.).
   - If discrepancies are identified between documentation and actual implementation or CLI behavior, report them in review steps instead of modifying files directly.
+  - Note: GitHub Copilot and Antigravity ARE authorized to edit these files based on their respective roles in REQUIREMENTS.md.
 - **Human-Led Git Operations:**
   - For change safety and governance, Git commits and pushes must strictly be performed by human developers (unless explicitly instructed for exceptional cases such as automated CI repair).
   - Claude Code must report verification results upon task completion and handle PR creation only after human developers have pushed the commits.
