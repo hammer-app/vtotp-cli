@@ -69,9 +69,13 @@ MSIX 版は、Nuitka の Standalone 成果物を MSIX レイアウトディレ�
 マニフェストとロゴ資産はリポジトリ内の `msix-layout/`（`AppxManifest.xml`、`Assets/`）として管理済みです。このディレクトリに Nuitka Standalone 成果物を配置してからパッケージ化します。
 
 1. 手順 1 と同じ Nuitka コマンドで Standalone 版をビルドします（`--onefile` は付けません）
-2. Standalone 成果物一式（`vtotp.exe` および依存 DLL / Python ランタイム）を `msix-layout/` 直下へコピーします
+2. 前回のビルド残骸を除去し、Standalone 成果物一式（`vtotp.exe` および依存 DLL / Python ランタイム）を `msix-layout/` 直下へコピーします
 
     ```powershell
+    # マニフェストとロゴ資産以外をクリーンアップ
+    Get-ChildItem .\msix-layout -Exclude "AppxManifest.xml", "Assets" | Remove-Item -Recurse -Force
+
+    # 新しい成果物をコピー
     Copy-Item .\dist\standalone\__main__.dist\* .\msix-layout\ -Recurse -Force
     ```
 
