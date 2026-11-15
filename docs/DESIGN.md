@@ -300,72 +300,87 @@ class KeyManager:
         ...
 
     def set_private_permissions(self, path: Path) -> None:
-        """鍵ファイルを実行ユーザーだけが読み書きできる状態にする"""
+        """Unix系の一時鍵ファイルにchmod 0600を適用する"""
         ...
 
-    def verify_windows_dacl(self, path: Path) -> None:
+    def verify_windows_dacl(self, handle: WindowsHandle) -> None:
         """
-        Windowsで対象ファイルのDACLを検査し、許可リスト外のアカウントへの
-        明示的な許可ACEが存在する場合はKeyStorageErrorを送出する
+        Windowsで作成済みハンドルのDACLを検査し、検証不能または許可リスト外の
+        許可ACEがある場合はKeyStorageErrorを送出する
         """
         ...
 ```
+
+`WindowsHandle` は Windows 固有処理の内部でのみ扱う概念上の型であり、共通の
+鍵保存処理の公開インターフェースに Win32 の型を持ち込まない。
 
 ### 鍵ファイル保存とパーミッション制御
 
 鍵の新規作成・更新は、既存ファイルを直接開かず、対象パスと同じディレクトリに
 一時ファイルを作成してから `os.replace` で配置する。`create_key_file` と
-`rotate_key_file` は次の共通フローを使用する。
+`rotate_key_file` は OS 固有の一時ファイル生成処理を呼び出す共通フローを使用する。
+生成処理は、アクセス権設定と必要な検証が完了した書き込み用ファイルとそのパスを返し、
+失敗時は自身が取得した資源を解放する。共通処理は Win32 ハンドルや SID を扱わない。
 
 ```text
 1. 親ディレクトリを作成または検証する。
-2. 予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
-3. 一時ファイルに実行ユーザー専用のパーミッション/ACLを設定する。
-4. Windowsでは、icacls適用完了後にDACL許可リスト再検証を実行する。
-   許可リスト外の許可ACEを検出した場合は一時ファイルを削除して中断する。
-5. 鍵を書き込み、flushおよびfsyncを実行する。
-6. 32バイトであることを検証し、`os.replace(temp_path, path)` で原子的に配置する。
-7. 成功時も失敗時も、一時ファイルが残っていれば削除する。
+2. OS 固有処理で予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
+   Unix系はmkstempとchmod 0600、Windowsは生成時の保護DACLと書き込み前の再検証を行う。
+3. 鍵を書き込み、flushおよびfsyncを実行し、ファイルを閉じる。
+4. 32バイトであることを検証し、`os.replace(temp_path, path)` で原子的に配置する。
+5. 成功時も失敗時も、自身が作成した一時ファイルが残っていれば削除する。
 ```
 
-`set_private_permissions` は外部依存パッケージを使用せず、OSごとに次の標準機能を
-使う。権限設定は鍵のバイト列を書き込む前に行う。
+外部依存パッケージは追加しない。OS 判定後に対応する生成処理のみを呼び出し、
+`ctypes` による Win32 DLL の読み込み、SID・DACL 処理および `msvcrt` の利用は
+Windows 固有処理内に閉じ込める。非 Windows 環境ではそれらを読み込み・評価しない。
+Unix系は従来どおり `tempfile.mkstemp` で排他作成し、書き込み前に
+`set_private_permissions` が `os.chmod(path, 0o600)` を実行する。
+同メソッドは Unix の権限設定に限定し、Windows では呼び出さない。Windows での
+`icacls.exe` のサブプロセス呼び出しと、作成後に ACL を設定する方式は廃止する。
 
-- **Unix系:** `os.chmod(path, 0o600)` を実行する。所有者以外の読み取り・書き込みを
-    許可しない。
-- **Windows:** `subprocess.run` で標準コマンド `icacls` を呼び出し、継承を無効化して
-    現在のユーザーへ明示的な読み取り・書き込み・削除権限だけを付与する。概念上の実行内容は
-    次の通りであり、実装では `shell=True` を使わず引数配列として渡す。
+### Windows の生成時 DACL と資源管理
 
-    ```text
-    <GetSystemDirectoryW()の戻り値>\icacls.exe <path> /inheritance:r /grant:r "*<現在のユーザーSID>:(R,W,D)"
-    ```
+Windows 専用の生成処理は、標準ライブラリの `ctypes` で必要な Win32 API の引数型と
+戻り値型を定義し、次の順で実行する。
 
-    `icacls.exe` のパスは `GetSystemDirectoryW` で取得した System32 の絶対パスから構成し、
-    `SystemRoot` 等の環境変数や PATH 検索には依存しない。ACL の付与先は環境変数や
-    `getpass.getuser()` から推測せず、`OpenProcessToken` と `GetTokenInformation(TokenUser)`
-    で取得したプロセストークンの真のユーザー SID を使用する。SID は `icacls` が受け付ける
-    `*S-1-...` 形式で引数配列に渡す。Win32 API の取得失敗も `KeyStorageError` として処理を
-    中断する。`subprocess.run(..., check=True, capture_output=True)` で終了コードを検査し、
-    標準出力・標準エラーには鍵の内容を含めず、失敗時のコマンド出力もユーザー向け例外へ
-    そのまま流さない。
+1. `OpenProcessToken` / `GetTokenInformation(TokenUser)` で実行プロセスのユーザー SID
+   を取得し、`ConvertSidToStringSidW` で文字列化する。環境変数やユーザー名から推測しない。
+2. 例えば `D:P(A;;FA;;;<現在のユーザーSID>)` の SDDL を構築する。`P` は親からの
+   DACL 継承を遮断し、`FA` は当該ユーザーにフルアクセスを付与する。削除権限を含むため、
+   親の子削除権限に依存せず置換・世代繰り上げ・一時ファイル削除を行える。
+3. `ConvertStringSecurityDescriptorToSecurityDescriptorW` でセキュリティ記述子を
+   作成し、`SECURITY_ATTRIBUTES` の `lpSecurityDescriptor` に設定する。
+   `nLength` を構造体サイズに設定し、ハンドル継承は無効にする。
+4. 同一ディレクトリの予測困難な名前に対し `CreateFileW` の `CREATE_NEW` を使用し、
+   当該属性を渡して排他的に作成する。作成と保護 DACL の付与は同一操作であり、
+   保護前の読み取りハンドル取得期間を設けない。書き込み・DACL 読み取りに必要な
+   アクセスを要求し、`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` を指定する。
+   名前衝突時のみ別のランダム名で有限回再試行し、衝突先の既存ファイルは削除しない。
+   それ以外の失敗や再試行上限到達時は中断する。
+5. 作成直後、鍵を書き込む前に、開いた同一ファイルのハンドルで
+   `verify_windows_dacl` を実行する。成功後にファイルハンドルを
+   `msvcrt.open_osfhandle`、続いて `os.fdopen` へ移譲して書き込み用ファイルを返す。
+   書き込み用ファイルは共通処理が閉じる。
 
-  - `D`（削除）を含めるのは、親フォルダの権限が「変更」のみ（子の削除権限なし）の
-    環境で、`(R,W)` だけでは `os.replace` による配置・世代繰り上げ・一時ファイル
-    削除が拒否されるためである。付与先は実行ユーザーのみであり、排他性は変わらない。
-  - 親フォルダから継承可能な権限がない場合など、OSまたはトークンの既定 DACL から付与
-    される `SYSTEM`、`Administrators`、`OWNER RIGHTS` の ACE、および現在のログオン
-    セッションを表す Logon SID（`S-1-5-5-...`）の ACE は残存を許容する。これらは
-    Windows の管理・所有者・セッションに結び付くエントリであり、任意の一般ユーザーへ
-    アクセスを許可するものではない。これらの ACE を除く一般ユーザーのアクセスは遮断
-    されていなければならない。この残存許容範囲は後述の「Windows DACL 許可リスト
-    再検証」のホワイトリストと一致し、icacls 適用後に機械的に再検証する。
+セキュリティ記述子および SID 文字列等、Win32 が割り当てたメモリは各 API の契約に
+従い `LocalFree` で解放し、トークンハンドルも `CloseHandle` で閉じる。ファイル
+ハンドルは `open_osfhandle` 成功前は `CloseHandle`、成功後は所有権を受け取った
+ファイルディスクリプタを `os.close`、`fdopen` 成功後はファイルオブジェクトを
+`close` して解放する。各段階で所有者を一つに限定し、変換失敗時も二重解放や
+ハンドル漏れを起こさない。セキュリティ記述子は `CreateFileW` が戻った後に解放する。
 
-ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace のいずれかが失敗した
-場合は、既存の `pass` で握りつぶさない。`OSError`、`subprocess.CalledProcessError`
-等を秘密情報を含まない `KeyStorageError` へ変換して処理を中断する。一時ファイルの
-削除を `finally` で試み、削除自体にも失敗した場合は元のエラーを優先しつつ、ログには
-鍵の内容を出さない。保存完了前に失敗した場合、既存の正式な鍵ファイルは変更しない。
+SID取得、SDDL変換、作成、DACL再検証、`chmod`、書き込み、資源解放または
+atomic replace の失敗は握りつぶさず、秘密情報・Win32 エラー詳細を含まない
+`KeyStorageError`（終了コード 1）へ変換して中断する。例外チェーンやログにも元の
+OS / Win32 エラー詳細を露出しない。自身が作成した一時ファイルはハンドルを閉じて
+から `finally` で削除する。削除にも失敗した場合は元のエラーを優先しつつ、
+秘密情報や OS エラー詳細を含まない警告で残存を通知する。保存完了前の失敗では
+既存の正式な鍵ファイルを変更せず、ローテーション中なら第12章の規則で復元する。
+
+鍵の配置先は、他ユーザーにファイル名の置換や DACL の変更を許さない、
+実行ユーザー専用ディレクトリを推奨する。同一ユーザーの別プロセスや許容された
+特権アカウントは DACL による遮断対象ではない。
 
 通常の `load_key` / `verify_key_file` の読み込み経路では、パーミッションやACLの検査を
 強制しない。FAT32 / exFAT のUSBメディアではUnixモードビットやWindows ACLが期待通り
@@ -373,23 +388,24 @@ ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace 
 形式だけを検証する。排他的なパーミッション設定は、鍵ファイルを生成・保存する処理
 に限定する。
 
-鍵の内容を例外メッセージ、ログ、サブプロセス出力へ含めない。
+鍵の内容を例外メッセージやログへ含めない。
 
 ### Windows DACL 許可リスト再検証
 
-`icacls` による ACL 設定は、権限の継承元やトークンの既定 DACL によって、実行
-ユーザー以外の明示的な許可 ACE が残存する場合がある。Issue #12 の受入条件である
-「作成後のファイル権限の再検証」を満たすため、Windows 環境では一時ファイルへの
-`icacls` 適用完了後、鍵バイト列の書き込み前に、DACL の許可リスト再検証を必須とする。
+生成時に保護 DACL を指定しても、実際に作成されたファイルの権限を確認する多層防御
+として、v0.3.0 の `verify_windows_dacl` による許可リスト再検証を維持する。
 
-- **適用契機:** 一時ファイルへの `icacls` 適用完了後、鍵データの書き込み前に実行する。
-    再検証は一時ファイルに対して行う。`os.replace` は同一ファイルの ACL を保持した
-    まま移動するため、正式配置後の再検証は不要とする。
+- **適用契機:** `CreateFileW` の成功直後、鍵データの書き込み前に一時ファイルを
+    検証する。同一ディレクトリ内の `os.replace` で同じファイルを配置するため、
+    正式配置後の再検証は不要とする。
 - **実装方針:** 外部依存ライブラリを追加せず、標準ライブラリの `ctypes` から
-    `advapi32.dll` の Win32 API を呼び出して DACL を検査する。`GetNamedSecurityInfoW`
-    で `DACL_SECURITY_INFORMATION` を指定して DACL を取得し、`GetAce` で各 ACE を
+    `advapi32.dll` の Win32 API を呼び出して DACL を検査する。パスの差し替えによる
+    別ファイルの検証を避けるため、作成したハンドルを `GetSecurityInfo` に渡し、
+    `DACL_SECURITY_INFORMATION` を指定して DACL を取得する。`GetAce` で各 ACE を
     走査し、ACE の SID を `ConvertSidToStringSidW` で文字列化して許可リストと照合する。
-    現在のセッションの Logon SID は `GetTokenInformation(TokenGroups)` で取得した
+    取得した記述子は `LocalFree` で解放する。`GetSecurityDescriptorControl` により
+    `SE_DACL_PROTECTED` も確認する。現在のセッションの Logon SID は
+    `GetTokenInformation(TokenGroups)` で取得した
     グループ SID のうち `SE_GROUP_LOGON_ID` 属性を持つ SID から特定する。
     これらの Win32 API 呼び出しが失敗した場合も検証不能とみなし、`KeyStorageError`
     で処理を中断する。
@@ -401,8 +417,9 @@ ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace 
   - `OWNER RIGHTS`（`S-1-3-4`）
   - 現在のログオンセッション SID（プロセストークンの `TokenGroups` から取得した、
     現在のプロセスに紐づく Logon SID）
-- **検証ルール:** 上記許可リストに含まれないアカウントに対する明示的な許可 ACE
-    （`ACCESS_ALLOWED_ACE`）が 1 つでも存在する場合は、即座に `KeyStorageError`
+- **検証ルール:** 上記許可リストに含まれないアカウントに対する許可 ACE
+    （`ACCESS_ALLOWED_ACE`）が、継承属性の有無を問わず 1 つでも存在する場合は、
+    即座に `KeyStorageError`
     （終了コード 1）を送出し、一時ファイルを安全に削除して処理を中断する。既存の
     正式な鍵ファイルは変更しない。
 
@@ -412,6 +429,8 @@ ACLまたは `chmod`、一時ファイル作成、書き込み、atomic replace 
   - **NULL DACL の拒否:** セキュリティ記述子が DACL を保持しない（NULL DACL）
     場合は、全ユーザーにフルアクセスを許可する状態と同等であり検証不能であるため、
     `KeyStorageError` を送出して処理を中断する。
+  - **保護されていない DACL の拒否:** `SE_DACL_PROTECTED` がない場合は親からの
+    継承を遮断できないため、`KeyStorageError` を送出して処理を中断する。
   - **未解釈 ACE 種別の拒否:** SID のオフセットを安全に解釈できない ACE 種別
     （`ACCESS_ALLOWED_OBJECT_ACE` 等の OBJECT 形式を含む、本仕様で列挙しない
     許可 ACE 種別）が 1 つでも含まれる場合は、許可対象を確定できないため検証不能
@@ -1050,7 +1069,15 @@ CliHandler
 ```text
 - 32バイト鍵が生成される
 - 不正サイズの鍵を拒否する
-- 許可リスト外の許可ACEを持つDACLをWindows再検証で拒否する
+- Windows生成処理が現在のユーザーSIDを含む保護SDDLを変換し、SECURITY_ATTRIBUTESと
+  CREATE_NEWをCreateFileWに渡す。生成・DACL再検証・書き込みの順序を検証する
+- 名前衝突時だけ有限回再試行し、衝突先を削除しない
+- 許可リストの各SIDを許容し、許可リスト外の許可ACE、NULL DACL、保護されていないDACL、
+  未解釈の許可ACE、Win32 API取得失敗を拒否する。拒否ACEはスキップする
+- SID取得・SDDL変換・CreateFileW・DACL再検証・ハンドル変換の各失敗を注入し、
+  書き込み・正式配置を行わず、所有する資源を一度だけ解放し一時ファイルを削除する
+- 削除失敗も安全に通知し、KeyStorageErrorと終了コード1に秘密情報やWin32エラー詳細が出ない
+- 非WindowsではWin32 DLL・msvcrtを読み込みも評価もせず、mkstempとchmod 0600を使う
 - 暗号化と復号で元データが復元される
 - 改ざんされた暗号文を拒否する
 - サービスの追加・更新・削除が機能する
@@ -1078,10 +1105,23 @@ CliHandler
 - rekey後の暗号化データにローテーション用の`.1`ファイルを作成しない
 - 旧鍵ではrekey後の暗号化データを復号できない
 - `--key`指定時は対象パスだけが更新され、config.jsonが変更されない
+- Windowsで親ディレクトリに他ユーザーへの継承可能な許可ACEを設定して一時ファイルを
+  生成し、作成直後・検証と鍵書き込み前に別ユーザーの非特権トークンから読み取りオープンが
+  ACCESS_DENIEDで拒否されることを確認する。別プロセスとの同期で当該時点を固定する
+- 同時点で実行ユーザーによる読み取りオープンは成功させ、共有違反・パス不在ではなく
+  DACLによる拒否であることを確認する。別ユーザーは許可SIDや管理者特権を持たない
+- Windowsで生成した一時ファイルの保護DACLと最終配置後のDACL、init/rekeyの成功・失敗時の
+  原子配置、世代復元、一時ファイル後片付けを検証する
+- Linux / macOSで一時・最終鍵ファイルの0600、init/rekey、原子配置と失敗時の後片付けを検証する
 - 鍵ファイルがない場合の終了コード
 - 暗号化ファイルが破損した場合の終了コード
 - Windows形式のパスを扱える
 ```
+
+別ユーザートークンを用いる Windows 実機テストは、そのトークンを用意できる専用環境で
+実施する。用意できない環境では理由付きでスキップし、モックによる代替を実機テストの
+成功とみなさない。実機テストは通常実行と同じ共有モードを使い、読み取り拒否の結果を
+検査する。特権アカウントや同一ユーザーからのアクセス拒否は要件としない。
 
 ## 17. セキュリティ上の留意点
 
@@ -1577,6 +1617,11 @@ checkout -> setup-python -> pip install -e ".[build]"
 第一引数固定、`config` 言語更新、`MsgKey` + context方式に置き換える。鍵パス・ストレージ
 パスの解決優先順位、AES-256-GCM、atomic保存、終了コード、Zero Leakage Ruleは既存章を
 引き続き適用する。
+
+鍵ファイル生成については第6章を正規仕様とし、Windows の `mkstemp` 後に
+`icacls` を適用する旧方式や Windows での `set_private_permissions` 呼び出しを
+採用しない。Unix系の `mkstemp` と `chmod 0600` は維持する。第16章の
+Windows 実機回帰テストと OS 非依存・Unix系回帰テストも併せて適用する。
 
 ## 25. MSIX パッケージング・ストア配布設計
 
