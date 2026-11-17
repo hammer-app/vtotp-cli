@@ -33,6 +33,7 @@ vtotp/
 │       ├── core/
 │       │   ├── __init__.py
 │       │   ├── key_manager.py
+│       │   ├── windows_key_file.py
 │       │   ├── secure_storage.py
 │       │   ├── totp_generator.py
 │       │   ├── config_manager.py
@@ -237,11 +238,7 @@ class CommandParseError(TotpCliError):
 
 ```python
 class KeyManager:
-    def __init__(
-        self,
-        file_system: FileSystem,
-        path_resolver: PathResolver,
-    ) -> None:
+    def __init__(self, on_cleanup_failure: Callable[[Path], None] | None = None) -> None:
         ...
 
     def generate_key(self) -> bytes:
@@ -303,30 +300,37 @@ class KeyManager:
         """Unix系の一時鍵ファイルにchmod 0600を適用する"""
         ...
 
-    def verify_windows_dacl(self, handle: WindowsHandle) -> None:
+    def verify_windows_dacl(self, handle: int, path: Path) -> None:
         """
         Windowsで作成済みハンドルのDACLを検査し、検証不能または許可リスト外の
-        許可ACEがある場合はKeyStorageErrorを送出する
+        許可ACEがある場合はKeyStorageErrorを送出する。DACL検査にはhandleを用い、
+        pathは失敗時に表示するコンテキストとしてのみ用いる。
         """
         ...
 ```
 
-`WindowsHandle` は Windows 固有処理の内部でのみ扱う概念上の型であり、共通の
-鍵保存処理の公開インターフェースに Win32 の型を持ち込まない。
+`on_cleanup_failure` は KeyManager 自身が作成した一時ファイルまたは最古世代の
+退避ファイルを削除できなかった場合、その残存パスを受け取る任意の通知コールバック
+である。OS エラー詳細や鍵の内容は渡さない。省略した場合は通知しない。
+
+Windows 固有処理は `src/vtotp/core/windows_key_file.py` に分離し、鍵保存の Windows
+分岐内で遅延インポートする。Win32 API、SID / SDDL / DACL、`msvcrt` は同モジュール内に
+閉じ込め、非 Windows 環境ではモジュールの読み込み・評価を発生させない。
 
 ### 鍵ファイル保存とパーミッション制御
 
 鍵の新規作成・更新は、既存ファイルを直接開かず、対象パスと同じディレクトリに
 一時ファイルを作成してから `os.replace` で配置する。`create_key_file` と
 `rotate_key_file` は OS 固有の一時ファイル生成処理を呼び出す共通フローを使用する。
-生成処理は、アクセス権設定と必要な検証が完了した書き込み用ファイルとそのパスを返し、
+生成処理は、アクセス権設定と必要な検証が完了したファイルディスクリプタとそのパスを返し、
 失敗時は自身が取得した資源を解放する。共通処理は Win32 ハンドルや SID を扱わない。
 
 ```text
 1. 親ディレクトリを作成または検証する。
 2. OS 固有処理で予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
    Unix系はmkstempとchmod 0600、Windowsは生成時の保護DACLと書き込み前の再検証を行う。
-3. 鍵を書き込み、flushおよびfsyncを実行し、ファイルを閉じる。
+3. 共通処理でファイルディスクリプタから書き込み用ファイルを構築し、鍵を書き込み、
+   flushおよびfsyncを実行して閉じる。
 4. 32バイトであることを検証し、`os.replace(temp_path, path)` で原子的に配置する。
 5. 成功時も失敗時も、自身が作成した一時ファイルが残っていれば削除する。
 ```
@@ -346,9 +350,11 @@ Windows 専用の生成処理は、標準ライブラリの `ctypes` で必要�
 
 1. `OpenProcessToken` / `GetTokenInformation(TokenUser)` で実行プロセスのユーザー SID
    を取得し、`ConvertSidToStringSidW` で文字列化する。環境変数やユーザー名から推測しない。
-2. 例えば `D:P(A;;FA;;;<現在のユーザーSID>)` の SDDL を構築する。`P` は親からの
-   DACL 継承を遮断し、`FA` は当該ユーザーにフルアクセスを付与する。削除権限を含むため、
-   親の子削除権限に依存せず置換・世代繰り上げ・一時ファイル削除を行える。
+2. SID 文字列が `S-1-\d+(-\d+)+` に一致することを正規表現で検証してから、
+   例えば `D:P(A;;FA;;;<現在のユーザーSID>)` の SDDL を構築する。これにより SID
+   以外の文字列が SDDL に混入することを防ぐ。`P` は親からの DACL 継承を遮断し、
+   `FA` は当該ユーザーにフルアクセスを付与する。削除権限を含むため、親の子削除権限に
+   依存せず置換・世代繰り上げ・一時ファイル削除を行える。
 3. `ConvertStringSecurityDescriptorToSecurityDescriptorW` でセキュリティ記述子を
    作成し、`SECURITY_ATTRIBUTES` の `lpSecurityDescriptor` に設定する。
    `nLength` を構造体サイズに設定し、ハンドル継承は無効にする。
@@ -356,19 +362,26 @@ Windows 専用の生成処理は、標準ライブラリの `ctypes` で必要�
    当該属性を渡して排他的に作成する。作成と保護 DACL の付与は同一操作であり、
    保護前の読み取りハンドル取得期間を設けない。書き込み・DACL 読み取りに必要な
    アクセスを要求し、`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` を指定する。
-   名前衝突時のみ別のランダム名で有限回再試行し、衝突先の既存ファイルは削除しない。
-   それ以外の失敗や再試行上限到達時は中断する。
+   名前衝突（`ERROR_FILE_EXISTS` / `ERROR_ALREADY_EXISTS`）時のみ別のランダム名で
+   最大16回再試行し、衝突先の既存ファイルは削除しない。それ以外の失敗や上限到達時は
+   中断する。
 5. 作成直後、鍵を書き込む前に、開いた同一ファイルのハンドルで
-   `verify_windows_dacl` を実行する。成功後にファイルハンドルを
-   `msvcrt.open_osfhandle`、続いて `os.fdopen` へ移譲して書き込み用ファイルを返す。
-   書き込み用ファイルは共通処理が閉じる。
+   `verify_windows_dacl(handle, path)` を実行する。DACL 検査はハンドルに対して行い、
+   `path` は `KeyStorageError` に設定する表示用コンテキストである。
+6. 検証後、`msvcrt.open_osfhandle` で Win32 ハンドルをファイルディスクリプタへ移譲し、
+   `create_protected_temp_file` は `(fd, temp_path)` を返す。以後 Win32 ハンドルは fd が
+   所有する。Windows 専用モジュールはファイルオブジェクトを生成しない。
+7. 共通処理の `KeyManager._open_writer(fd)` が `io.FileIO(fd, "wb")`、次に
+   `io.BufferedWriter(raw)` を段階的に生成する。各段階で所有者を一つにし、
+   `FileIO` 生成失敗時は fd を閉じ、バッファ生成失敗時は `raw` を閉じる。
+   成功時は `BufferedWriter` が所有し、共通の保存処理がファイルを閉じる。
 
 セキュリティ記述子および SID 文字列等、Win32 が割り当てたメモリは各 API の契約に
-従い `LocalFree` で解放し、トークンハンドルも `CloseHandle` で閉じる。ファイル
-ハンドルは `open_osfhandle` 成功前は `CloseHandle`、成功後は所有権を受け取った
-ファイルディスクリプタを `os.close`、`fdopen` 成功後はファイルオブジェクトを
-`close` して解放する。各段階で所有者を一つに限定し、変換失敗時も二重解放や
-ハンドル漏れを起こさない。セキュリティ記述子は `CreateFileW` が戻った後に解放する。
+従い `LocalFree` で解放し、トークンハンドルも `CloseHandle` で閉じる。セキュリティ
+記述子は `CreateFileW` が戻った後に一度だけ解放する。ファイルハンドルは
+`open_osfhandle` 成功前は Windows 専用モジュールが `CloseHandle` で閉じる。
+成功後は fd 側へ所有権が移り、共通処理が `FileIO` / `BufferedWriter` の段階的構築と
+解放を担う。変換失敗時も二重解放やハンドル漏れを起こさない。
 
 SID取得、SDDL変換、作成、DACL再検証、`chmod`、書き込み、資源解放または
 atomic replace の失敗は握りつぶさず、秘密情報・Win32 エラー詳細を含まない
@@ -392,8 +405,11 @@ OS / Win32 エラー詳細を露出しない。自身が作成した一時ファ
 
 ### Windows DACL 許可リスト再検証
 
-生成時に保護 DACL を指定しても、実際に作成されたファイルの権限を確認する多層防御
-として、`verify_windows_dacl` による許可リスト再検証を維持する。
+`CreateFileW` にセキュリティ記述子と明示的 DACL を渡すと、SDDL に `P` がない場合でも
+Windows は作成したファイルの DACL を保護済みとして扱い、親フォルダの ACE を継承しない
+（Windows 実機で確認）。設計では意図を明確にするため SDDL に `P` も明示する。
+`GetSecurityDescriptorControl` による `SE_DACL_PROTECTED` 検査は、この Windows の挙動を
+確認する多層防御であり、未保護 DACL をフェイルクローズで拒否する。
 
 - **適用契機:** `CreateFileW` の成功直後、鍵データの書き込み前に一時ファイルを
     検証する。同一ディレクトリ内の `os.replace` で同じファイルを配置するため、
@@ -404,7 +420,10 @@ OS / Win32 エラー詳細を露出しない。自身が作成した一時ファ
     `DACL_SECURITY_INFORMATION` を指定して DACL を取得する。`GetAce` で各 ACE を
     走査し、ACE の SID を `ConvertSidToStringSidW` で文字列化して許可リストと照合する。
     取得した記述子は `LocalFree` で解放する。`GetSecurityDescriptorControl` により
-    `SE_DACL_PROTECTED` も確認する。現在のセッションの Logon SID は
+    `SE_DACL_PROTECTED` も確認する。明示的 DACL を持つ生成経路では Windows が
+    保護済みとして扱う想定だが、この確認はその実挙動を検出する追加のフェイルクローズ
+    防御であり、未保護 DACL を拒否する通常の生成時検証は多層防御として維持する。
+    現在のセッションの Logon SID は
     `GetTokenInformation(TokenGroups)` で取得した
     グループ SID のうち `SE_GROUP_LOGON_ID` 属性を持つ SID から特定する。
     これらの Win32 API 呼び出しが失敗した場合も検証不能とみなし、`KeyStorageError`
@@ -1076,8 +1095,15 @@ CliHandler
   未解釈の許可ACE、Win32 API取得失敗を拒否する。拒否ACEはスキップする
 - SID取得・SDDL変換・CreateFileW・DACL再検証・ハンドル変換の各失敗を注入し、
   書き込み・正式配置を行わず、所有する資源を一度だけ解放し一時ファイルを削除する
-- 削除失敗も安全に通知し、KeyStorageErrorと終了コード1に秘密情報やWin32エラー詳細が出ない
+- `_open_writer` の `FileIO` / `BufferedWriter` 各構築失敗で、その時点の所有者が fd または
+  raw ファイルを一度だけ閉じる
+- 削除失敗時に通知コールバックへ残存パスだけを渡し、`KeyStorageError` と終了コード1に
+  秘密情報やWin32エラー詳細が出ない
 - 非WindowsではWin32 DLL・msvcrtを読み込みも評価もせず、mkstempとchmod 0600を使う
+- Windows実機で親フォルダに Everyone の継承可能 ACE を設定して鍵を生成し、書き込み前の
+  一時ファイル、正式配置後の鍵、および世代ファイルの DACL が保護されていることを確認する
+- Windows実機で鍵に CR / LF / ^Z を含むバイナリデータを使い、生成・保存・再読み込みで
+  バイト列が変化しないことを確認する
 - 暗号化と復号で元データが復元される
 - 改ざんされた暗号文を拒否する
 - サービスの追加・更新・削除が機能する
@@ -1105,23 +1131,17 @@ CliHandler
 - rekey後の暗号化データにローテーション用の`.1`ファイルを作成しない
 - 旧鍵ではrekey後の暗号化データを復号できない
 - `--key`指定時は対象パスだけが更新され、config.jsonが変更されない
-- Windowsで親ディレクトリに他ユーザーへの継承可能な許可ACEを設定して一時ファイルを
-  生成し、作成直後・検証と鍵書き込み前に別ユーザーの非特権トークンから読み取りオープンが
-  ACCESS_DENIEDで拒否されることを確認する。別プロセスとの同期で当該時点を固定する
-- 同時点で実行ユーザーによる読み取りオープンは成功させ、共有違反・パス不在ではなく
-  DACLによる拒否であることを確認する。別ユーザーは許可SIDや管理者特権を持たない
-- Windowsで生成した一時ファイルの保護DACLと最終配置後のDACL、init/rekeyの成功・失敗時の
-  原子配置、世代復元、一時ファイル後片付けを検証する
 - Linux / macOSで一時・最終鍵ファイルの0600、init/rekey、原子配置と失敗時の後片付けを検証する
 - 鍵ファイルがない場合の終了コード
 - 暗号化ファイルが破損した場合の終了コード
 - Windows形式のパスを扱える
 ```
 
-別ユーザートークンを用いる Windows 実機テストは、そのトークンを用意できる専用環境で
-実施する。用意できない環境では理由付きでスキップし、モックによる代替を実機テストの
-成功とみなさない。実機テストは通常実行と同じ共有モードを使い、読み取り拒否の結果を
-検査する。特権アカウントや同一ユーザーからのアクセス拒否は要件としない。
+偽 Win32 層を用いる単体テストは OS を問わず生成フロー、エラー処理、資源所有権を検証する。
+Windows 実機テストは Windows 専用の実装済みテストとして実行し、Linux 等ではスキップする。
+別ユーザーの非特権トークンによる読み取り拒否テストは現行テストスイートには含まれない。
+今後追加する場合は別ユーザーの資格情報を用意できる専用環境で実施し、実施環境がない場合は
+未実施として扱う。偽 Win32 層の結果を当該実機テストの代替・成功とはみなさない。
 
 ## 17. セキュリティ上の留意点
 
@@ -1380,6 +1400,7 @@ class MsgKey(StrEnum):
     COMMAND_PARSE_ERROR = "command_parse_error"
     SECRET_ARG_DEPRECATED = "secret_arg_deprecated"
     STDIN_OPTION_REQUIRED = "stdin_option_required"
+    KEY_TEMP_FILE_LEFTOVER = "key_temp_file_leftover"
     CONFIG_SUMMARY = "config_summary"
     CONFIG_LANGUAGE_UPDATED = "config_language_updated"
 
@@ -1389,11 +1410,13 @@ EN_CATALOG: Catalog = {
     # 他のメッセージキーは省略
     MsgKey.SECRET_ARG_DEPRECATED: "The --secret/-s option has been removed for security. Use interactive prompt or --stdin.",
     MsgKey.STDIN_OPTION_REQUIRED: "Standard input is not a terminal. Use --stdin to pass secrets via pipe or redirect.",
+    MsgKey.KEY_TEMP_FILE_LEFTOVER: "Could not remove a temporary key file. Delete it manually: {path}",
 }
 JA_CATALOG: Catalog = {
     # 他のメッセージキーは省略
     MsgKey.SECRET_ARG_DEPRECATED: "--secret/-s オプションはセキュリティのため廃止されました。対話入力または --stdin を使用してください。",
     MsgKey.STDIN_OPTION_REQUIRED: "標準入力がターミナルではありません。パイプやリダイレクトでシークレットを渡す場合は --stdin を指定してください。",
+    MsgKey.KEY_TEMP_FILE_LEFTOVER: "一時鍵ファイルを削除できませんでした。手動で削除してください: {path}",
 }
 SUPPORTED_LANGUAGES = ("en", "ja")
 ```
@@ -1430,6 +1453,11 @@ SUPPORTED_LANGUAGES = ("en", "ja")
 表示しない。秘密情報（鍵バイト列、シークレット、暗号文、復号JSON）はコンテキストへ
 渡さず、パス名・サービス名も必要な場合だけ含める。OS例外の生メッセージも表示せず、
 対応する `MsgKey` と安全なパス表示へ変換する。
+
+鍵一時ファイル（最古世代の退避ファイルを含む）の削除に失敗した場合、`KeyManager` は
+任意の `on_cleanup_failure(path)` コールバックへ残存パスのみを渡す。`CliHandler` は
+`MsgKey.KEY_TEMP_FILE_LEFTOVER` の警告を stderr に表示し、利用者へ手動削除を案内する。
+表示するコンテキストは残存パスだけとし、鍵の内容や OS エラー詳細は含めない。
 
 ## 20. CLI構文と引数解析の正規仕様
 
