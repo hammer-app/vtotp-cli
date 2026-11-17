@@ -208,7 +208,11 @@ class CliHandler:
         config.jsonパス）が使用される。テストからはこれらを注入して
         ふるまいを検証できる。
         """
-        self._key_manager = key_manager if key_manager is not None else KeyManager()
+        self._key_manager = (
+            key_manager
+            if key_manager is not None
+            else KeyManager(on_cleanup_failure=self._warn_key_temp_file_leftover)
+        )
         self._secure_storage = (
             secure_storage if secure_storage is not None else SecureStorage()
         )
@@ -681,6 +685,19 @@ class CliHandler:
         if not secret:
             raise InvalidSecretError(MsgKey.SECRET_EMPTY)
         return secret
+
+    def _warn_key_temp_file_leftover(self, path: Path) -> None:
+        """鍵の一時ファイル（退避ファイルを含む）が削除できず残存したことを警告する。
+
+        `KeyManager` の `on_cleanup_failure` として呼び出される。残存した
+        パスだけを stderr へ示し、OS のエラー詳細や鍵の内容は出力しない。
+        """
+        formatter.write_warning(
+            MsgKey.KEY_TEMP_FILE_LEFTOVER,
+            self._current_language,
+            stream=self._stderr,
+            path=str(path),
+        )
 
     def _confirm_existing_key_warning(self, path: Path) -> bool:
         """`init` の第1警告：既存鍵ファイルの上書き確認。"""

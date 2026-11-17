@@ -14,6 +14,7 @@ from typing import Callable
 import pytest
 
 from vtotp.cli.handler import CliHandler, ENV_KEY_PATH_VARIABLE
+from vtotp.core import windows_key_file
 from vtotp.core.key_manager import KeyManager
 from vtotp.core.secure_storage import SecureStorage
 from vtotp.domain.exceptions import CommandParseError
@@ -569,8 +570,9 @@ class TestInitCommand:
         def _raise_os_error(*args: object, **kwargs: object) -> None:
             raise OSError("simulated permission failure")
 
+        # Unix系は chmod、Windows は保護 DACL 用のユーザー SID 取得を失敗させる。
         monkeypatch.setattr(os, "chmod", _raise_os_error)
-        monkeypatch.setattr("subprocess.run", _raise_os_error)
+        monkeypatch.setattr(windows_key_file, "current_user_sid", _raise_os_error)
 
         key_dir = tmp_path / "vault"
         key_path = key_dir / "master.key"
@@ -583,6 +585,49 @@ class TestInitCommand:
         assert "Failed to restrict access to the key file" in stderr.getvalue()
         assert "Traceback" not in stderr.getvalue()
         assert list(key_dir.iterdir()) == []
+
+    def test_leftover_temp_key_file_is_reported_as_warning(
+        self,
+        handler_factory: Callable[..., CliHandler],
+        tmp_path: Path,
+        stdout: io.StringIO,
+        stderr: io.StringIO,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """鍵の配置と一時ファイルの削除がともに失敗した場合、元のエラーで終了しつつ、
+        残存した一時ファイルのパスだけを警告し、OS のエラー詳細を出さないことを確認する。
+        """
+        real_replace = os.replace
+        real_unlink = Path.unlink
+
+        def _replace(source: Path, destination: Path) -> None:
+            if str(source).endswith(".tmp"):
+                raise OSError("SENTINEL-REPLACE")
+            real_replace(source, destination)
+
+        def _unlink(self: Path, missing_ok: bool = False) -> None:
+            if self.name.endswith(".tmp"):
+                raise OSError("SENTINEL-UNLINK")
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(os, "replace", _replace)
+        monkeypatch.setattr(Path, "unlink", _unlink)
+        key_dir = tmp_path / "vault"
+        key_path = key_dir / "master.key"
+
+        exit_code = handler_factory().run(["init", "--key", str(key_path)])
+
+        assert exit_code == 1
+        assert stdout.getvalue() == ""
+        (leftover,) = key_dir.iterdir()
+        output = stderr.getvalue()
+        assert (
+            f"Warning: Could not remove a temporary key file. "
+            f"Delete it manually: {leftover}"
+        ) in output
+        assert f"Failed to save the key file: {key_path}" in output
+        assert "SENTINEL" not in output
+        assert "Traceback" not in output
 
     def test_unexpected_os_error_outside_key_storage_falls_back_to_exit_code_1(
         self,
@@ -1726,7 +1771,7 @@ class TestRekeyCommand:
 
         with monkeypatch.context() as patch:
             patch.setattr(os, "chmod", _raise_os_error)
-            patch.setattr("subprocess.run", _raise_os_error)
+            patch.setattr(windows_key_file, "current_user_sid", _raise_os_error)
             exit_code = handler_factory().run(["rekey", "--key", str(key_path)])
 
         assert exit_code == 1

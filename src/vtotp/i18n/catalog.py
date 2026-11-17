@@ -30,6 +30,7 @@ class MsgKey(StrEnum):
     KEY_UNREADABLE = "key_unreadable"
     KEY_STORAGE_FAILED = "key_storage_failed"
     KEY_PERMISSION_SETUP_FAILED = "key_permission_setup_failed"
+    KEY_TEMP_FILE_LEFTOVER = "key_temp_file_leftover"
 
     STORAGE_FILE_NOT_FOUND = "storage_file_not_found"
     STORAGE_FILE_UNREADABLE = "storage_file_unreadable"
@@ -109,6 +110,9 @@ EN_CATALOG: Catalog = {
     MsgKey.KEY_STORAGE_FAILED: "Failed to save the key file: {path}",
     MsgKey.KEY_PERMISSION_SETUP_FAILED: (
         "Failed to restrict access to the key file to the current user: {path}"
+    ),
+    MsgKey.KEY_TEMP_FILE_LEFTOVER: (
+        "Could not remove a temporary key file. Delete it manually: {path}"
     ),
     MsgKey.STORAGE_FILE_NOT_FOUND: "Encrypted storage file not found: {path}",
     MsgKey.STORAGE_FILE_UNREADABLE: "Could not read the encrypted storage file: {path}",
@@ -209,6 +213,9 @@ JA_CATALOG: Catalog = {
     MsgKey.KEY_STORAGE_FAILED: "鍵ファイルを保存できませんでした: {path}",
     MsgKey.KEY_PERMISSION_SETUP_FAILED: (
         "鍵ファイルのアクセス権限を実行ユーザー専用に設定できませんでした: {path}"
+    ),
+    MsgKey.KEY_TEMP_FILE_LEFTOVER: (
+        "一時鍵ファイルを削除できませんでした。手動で削除してください: {path}"
     ),
     MsgKey.STORAGE_FILE_NOT_FOUND: "暗号化データファイルが見つかりません: {path}",
     MsgKey.STORAGE_FILE_UNREADABLE: "暗号化データファイルを読み込めません: {path}",

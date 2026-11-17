@@ -4,18 +4,21 @@ DESIGN.md 6章「KeyManager」に基づき、鍵の生成・読み込み・検�
 CLI/環境変数/config.jsonからのパス解決、および世代管理（ローテーション）を
 提供する。鍵の内容はいかなる場合もログや例外メッセージへ出力しない
 （Zero Leakage Rule）。
+
+鍵の一時ファイル生成は OS ごとに分離する。Windows 固有の処理（Win32 API・
+SID・DACL・`msvcrt`）は :mod:`vtotp.core.windows_key_file` に閉じ込め、
+Windows 上で鍵を保存・検証する場合にのみ遅延インポートする。
 """
 
 from __future__ import annotations
 
 import contextlib
-import ctypes
+import io
 import os
 import secrets
-import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import BinaryIO, Callable
 
 from vtotp.domain.exceptions import (
     InvalidKeyError,
@@ -28,311 +31,6 @@ from vtotp.i18n.catalog import MsgKey
 def _is_windows() -> bool:
     """実行環境がWindowsかどうかを返す（テストで差し替え可能にするための関数）。"""
     return os.name == "nt"
-
-
-#: `OpenProcessToken` の要求アクセス権（トークン情報の参照のみ）。
-_TOKEN_QUERY: int = 0x0008
-
-#: `GetTokenInformation` の情報クラス `TokenUser`。
-_TOKEN_USER_CLASS: int = 1
-
-#: `GetTokenInformation` の情報クラス `TokenGroups`。
-_TOKEN_GROUPS_CLASS: int = 2
-
-#: ログオンセッション SID を表すグループ属性 `SE_GROUP_LOGON_ID`。
-_SE_GROUP_LOGON_ID: int = 0xC0000000
-
-#: `GetSystemDirectoryW` に渡すバッファの文字数（拡張パス長の上限）。
-_SYSTEM_DIRECTORY_BUFFER_CHARS: int = 32768
-
-#: `GetNamedSecurityInfoW` の対象種別 `SE_FILE_OBJECT`。
-_SE_FILE_OBJECT: int = 1
-
-#: `GetNamedSecurityInfoW` で DACL を要求する `DACL_SECURITY_INFORMATION`。
-_DACL_SECURITY_INFORMATION: int = 0x00000004
-
-#: SID を照合する許可 ACE 種別（通常形式の `ACCESS_ALLOWED_ACE` のみ。SID が
-#: ヘッダーとアクセスマスクの直後に続く）。CALLBACK・OBJECT 形式など、これ以外の
-#: 許可 ACE は DESIGN.md 6章に従い未解釈として拒否する（フェイルクローズ）。
-_ACCESS_ALLOWED_ACE_TYPES: frozenset[int] = frozenset({0x00})
-
-#: アクセスを拒否する ACE 種別（`ACCESS_DENIED_ACE` と、その OBJECT /
-#: CALLBACK / CALLBACK_OBJECT 版）。許可を与えないため再検証の対象外とする。
-_ACCESS_DENIED_ACE_TYPES: frozenset[int] = frozenset({0x01, 0x06, 0x0A, 0x0C})
-
-#: `ACE_HEADER`（4バイト）と `ACCESS_MASK`（4バイト）に続く SID の開始位置。
-_ACE_SID_OFFSET: int = 8
-
-
-class _AclHeader(ctypes.Structure):
-    """Win32 の `ACL` 構造体（ACE 本体はこのヘッダーの後に続く）。"""
-
-    _fields_ = [
-        ("AclRevision", ctypes.c_uint8),
-        ("Sbz1", ctypes.c_uint8),
-        ("AclSize", ctypes.c_uint16),
-        ("AceCount", ctypes.c_uint16),
-        ("Sbz2", ctypes.c_uint16),
-    ]
-
-
-class _AceHeader(ctypes.Structure):
-    """Win32 の `ACE_HEADER` 構造体。"""
-
-    _fields_ = [
-        ("AceType", ctypes.c_uint8),
-        ("AceFlags", ctypes.c_uint8),
-        ("AceSize", ctypes.c_uint16),
-    ]
-
-
-class _SidAndAttributes(ctypes.Structure):
-    """Win32 の `SID_AND_ATTRIBUTES` 構造体。"""
-
-    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_uint32)]
-
-
-class _TokenGroups(ctypes.Structure):
-    """Win32 の `TOKEN_GROUPS` 構造体（`Groups` は可変長配列の先頭要素）。"""
-
-    _fields_ = [("GroupCount", ctypes.c_uint32), ("Groups", _SidAndAttributes * 1)]
-
-
-def _load_windows_library(name: str) -> Any:
-    """Win32 のDLLを読み込む（テストで偽のDLLへ差し替え可能にするための関数）。
-
-    `ctypes.WinDLL` はWindowsでのみ提供されるため、存在しない環境では
-    :class:`OSError` を送出する。
-    """
-    loader = getattr(ctypes, "WinDLL", None)
-    if loader is None:
-        raise OSError(f"{name} is only available on Windows")
-    return loader(name, use_last_error=True)
-
-
-def _windows_system_directory() -> str:
-    """`GetSystemDirectoryW` で実際の System32 ディレクトリの絶対パスを返す。
-
-    `SystemRoot` 等の環境変数には依存しない。取得に失敗した場合は
-    :class:`OSError` を送出する。
-    """
-    kernel32 = _load_windows_library("kernel32")
-    kernel32.GetSystemDirectoryW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
-    kernel32.GetSystemDirectoryW.restype = ctypes.c_uint32
-
-    buffer = ctypes.create_unicode_buffer(_SYSTEM_DIRECTORY_BUFFER_CHARS)
-    length = kernel32.GetSystemDirectoryW(buffer, _SYSTEM_DIRECTORY_BUFFER_CHARS)
-    if not 0 < length < _SYSTEM_DIRECTORY_BUFFER_CHARS:
-        raise OSError("GetSystemDirectoryW failed")
-    return buffer.value
-
-
-def _configure_sid_conversion(advapi32: Any, kernel32: Any) -> None:
-    """`ConvertSidToStringSidW` と `LocalFree` の引数・戻り値の型を設定する。"""
-    advapi32.ConvertSidToStringSidW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
-
-def _sid_to_string(advapi32: Any, kernel32: Any, sid: int | None) -> str:
-    """バイナリ SID を `S-1-...` 形式の文字列へ変換する。
-
-    `ConvertSidToStringSidW` が確保した文字列領域は必ず解放する。変換に
-    失敗した場合は :class:`OSError` を送出する。呼び出し前に
-    :func:`_configure_sid_conversion` で型を設定しておくこと。
-    """
-    string_sid = ctypes.c_void_p()
-    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(string_sid)):
-        raise OSError("ConvertSidToStringSidW failed")
-    try:
-        return ctypes.wstring_at(string_sid)
-    finally:
-        kernel32.LocalFree(string_sid)
-
-
-def _token_user_sid_pointers(buffer: ctypes.Array[ctypes.c_char]) -> list[int | None]:
-    """`TOKEN_USER` からユーザー SID のポインタを取り出す。
-
-    `TOKEN_USER` は `SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }` で
-    始まるため、先頭のポインタ値がユーザー SID を指す。
-    """
-    return [ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]]
-
-
-def _token_logon_sid_pointers(buffer: ctypes.Array[ctypes.c_char]) -> list[int | None]:
-    """`TOKEN_GROUPS` から `SE_GROUP_LOGON_ID` 属性を持つグループ SID のポインタを取り出す。
-
-    グループが 0 件のトークンでは、バッファが `_TokenGroups` 構造体（配列要素
-    1 件分を含む）より小さくなり得る。`from_buffer` はサイズ不足で
-    :class:`ValueError` を送出するため、サイズ検査を伴わない `cast` で
-    先頭の `GroupCount` だけを読み取る。
-    """
-    header = ctypes.cast(buffer, ctypes.POINTER(_TokenGroups)).contents
-    groups = ctypes.cast(
-        ctypes.addressof(buffer) + _TokenGroups.Groups.offset,
-        ctypes.POINTER(_SidAndAttributes),
-    )
-    return [
-        groups[index].Sid
-        for index in range(header.GroupCount)
-        if groups[index].Attributes & _SE_GROUP_LOGON_ID == _SE_GROUP_LOGON_ID
-    ]
-
-
-def _token_sids(
-    info_class: int,
-    select_sids: Callable[[ctypes.Array[ctypes.c_char]], list[int | None]],
-) -> list[str]:
-    """現在のプロセストークンの情報クラス `info_class` から SID を文字列で返す。
-
-    `OpenProcessToken` と `GetTokenInformation` で取得したバッファから
-    `select_sids` が選んだ SID を `ConvertSidToStringSidW` で文字列化する。
-    トークンハンドルと文字列 SID の領域は必ず解放する。取得に失敗した場合は
-    :class:`OSError` を送出する。
-    """
-    advapi32 = _load_windows_library("advapi32")
-    kernel32 = _load_windows_library("kernel32")
-    kernel32.GetCurrentProcess.argtypes = []
-    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
-    _configure_sid_conversion(advapi32, kernel32)
-    advapi32.OpenProcessToken.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.OpenProcessToken.restype = ctypes.c_int
-    advapi32.GetTokenInformation.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    advapi32.GetTokenInformation.restype = ctypes.c_int
-
-    token = ctypes.c_void_p()
-    if not advapi32.OpenProcessToken(
-        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
-    ):
-        raise OSError("OpenProcessToken failed")
-    try:
-        # 1回目の呼び出しで必要なバッファサイズを取得する
-        # （この呼び出し自体はバッファ不足で失敗するのが正常）。
-        required_size = ctypes.c_uint32(0)
-        advapi32.GetTokenInformation(
-            token, info_class, None, 0, ctypes.byref(required_size)
-        )
-        if required_size.value == 0:
-            raise OSError("GetTokenInformation returned no size")
-        information = ctypes.create_string_buffer(required_size.value)
-        if not advapi32.GetTokenInformation(
-            token,
-            info_class,
-            information,
-            required_size.value,
-            ctypes.byref(required_size),
-        ):
-            raise OSError("GetTokenInformation failed")
-
-        return [
-            _sid_to_string(advapi32, kernel32, sid) for sid in select_sids(information)
-        ]
-    finally:
-        kernel32.CloseHandle(token)
-
-
-def _current_user_sid() -> str:
-    """現在のプロセストークンからユーザー SID（`S-1-5-21-...` 形式）を返す。
-
-    環境変数や `getpass.getuser()` には依存せず、`GetTokenInformation(TokenUser)`
-    で取得した SID を使う。取得に失敗した場合は :class:`OSError` を送出する。
-    """
-    return _token_sids(_TOKEN_USER_CLASS, _token_user_sid_pointers)[0]
-
-
-def _current_logon_sids() -> frozenset[str]:
-    """現在のプロセスに紐づくログオンセッション SID（`S-1-5-5-X-Y` 形式）を返す。
-
-    `GetTokenInformation(TokenGroups)` のグループのうち、属性に
-    `SE_GROUP_LOGON_ID` を持つものだけを抽出する。他のセッションの Logon SID は
-    含まない。取得に失敗した場合は :class:`OSError` を送出する。
-    """
-    return frozenset(_token_sids(_TOKEN_GROUPS_CLASS, _token_logon_sid_pointers))
-
-
-def _granting_ace_sids(path: Path) -> list[str]:
-    """`path` の DACL から、アクセスを許可し得る ACE の SID を文字列で列挙する。
-
-    `GetNamedSecurityInfoW(DACL_SECURITY_INFORMATION)` で DACL を取得し、
-    `GetAce` で走査する。拒否 ACE は許可を与えないため対象外とする。
-    次の場合は検証不能として :class:`OSError` を送出する（フェイルクローズ）。
-
-    - Win32 API（DACL 取得・ACE 取得・SID 文字列化）の失敗
-    - NULL DACL（全員にフルアクセスを与える状態）
-    - SID の位置を解釈できない、許可・拒否以外の ACE 種別
-
-    `GetNamedSecurityInfoW` が確保したセキュリティ記述子は必ず解放する。
-    """
-    advapi32 = _load_windows_library("advapi32")
-    kernel32 = _load_windows_library("kernel32")
-    advapi32.GetNamedSecurityInfoW.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.c_int,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
-    advapi32.GetAce.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.GetAce.restype = ctypes.c_int
-    _configure_sid_conversion(advapi32, kernel32)
-
-    dacl = ctypes.c_void_p()
-    descriptor = ctypes.c_void_p()
-    status = advapi32.GetNamedSecurityInfoW(
-        str(path),
-        _SE_FILE_OBJECT,
-        _DACL_SECURITY_INFORMATION,
-        None,
-        None,
-        ctypes.byref(dacl),
-        None,
-        ctypes.byref(descriptor),
-    )
-    if status != 0:
-        raise OSError("GetNamedSecurityInfoW failed")
-    try:
-        if not dacl.value:
-            raise OSError("NULL DACL grants access to everyone")
-        ace_count = ctypes.cast(dacl, ctypes.POINTER(_AclHeader)).contents.AceCount
-        sids: list[str] = []
-        for index in range(ace_count):
-            ace = ctypes.c_void_p()
-            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
-                raise OSError("GetAce failed")
-            ace_type = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents.AceType
-            if ace_type in _ACCESS_DENIED_ACE_TYPES:
-                continue
-            if ace_type not in _ACCESS_ALLOWED_ACE_TYPES:
-                raise OSError("unsupported ACE type in DACL")
-            sid_address = ace.value + _ACE_SID_OFFSET
-            sids.append(_sid_to_string(advapi32, kernel32, sid_address))
-        return sids
-    finally:
-        kernel32.LocalFree(descriptor)
 
 
 class KeyManager:
@@ -351,17 +49,24 @@ class KeyManager:
     #: Unix系OSで鍵ファイルへ設定するパーミッション（所有者のみ読み書き可）。
     UNIX_PRIVATE_MODE: int = 0o600
 
-    #: Windowsで実行ユーザーへ付与するACL権限。読み書きに加え、自身の削除（D）を
-    #: 含める。親ディレクトリが「変更」権限のみ（FILE_DELETE_CHILDなし）の場合、
-    #: Dが無いと `os.replace` による配置・世代繰り上げ・一時ファイル削除が失敗する。
-    WINDOWS_PRIVATE_GRANT: str = "(R,W,D)"
-
     #: DACL 再検証で、実行ユーザーと現在の Logon SID 以外に許可 ACE の残存を
     #: 認める既知の SID（`SYSTEM` / `Administrators` / `OWNER RIGHTS`。
     #: REQUIREMENTS.md 4.1 の注記）。
     WINDOWS_ALLOWED_WELL_KNOWN_SIDS: frozenset[str] = frozenset(
         {"S-1-5-18", "S-1-5-32-544", "S-1-3-4"}
     )
+
+    def __init__(
+        self, on_cleanup_failure: Callable[[Path], None] | None = None
+    ) -> None:
+        """鍵ファイル管理を初期化する。
+
+        `on_cleanup_failure` は、自身が作成した一時ファイル（最古世代の退避
+        ファイルを含む）を削除できず残存した場合に、そのパスを受け取って利用者へ
+        通知するコールバックである。OS のエラー詳細や鍵の内容は渡さない。
+        省略時は通知しない。
+        """
+        self._on_cleanup_failure = on_cleanup_failure
 
     def generate_key(self) -> bytes:
         """暗号学的に安全な32バイト鍵を生成する。"""
@@ -468,61 +173,49 @@ class KeyManager:
             )
 
     def set_private_permissions(self, path: Path) -> None:
-        """鍵ファイルを実行ユーザーだけが読み書きできる状態にする。
+        """Unix系の一時鍵ファイルを所有者だけが読み書きできる状態（0600）にする。
 
-        Unix系では `os.chmod(path, 0o600)` を実行する。Windowsでは標準コマンド
-        `icacls` を引数配列（`shell=False`）で呼び出し、親フォルダからの継承を
-        遮断したうえで、プロセストークンから取得した実行ユーザーの SID
-        （`*S-1-...` 形式）のみに権限を付与する。Win32 APIの失敗を含め、いずれの失敗も
-        握りつぶさず :class:`KeyStorageError` として送出する。OSのエラー詳細や
-        コマンド出力は例外の表示内容に含めない（Zero Leakage Rule）。
+        `os.chmod(path, 0o600)` を実行する。Windows の鍵保存では呼び出さない
+        （生成時点で保護 DACL を付与する :mod:`vtotp.core.windows_key_file`
+        を使う）。失敗は握りつぶさず :class:`KeyStorageError` として送出し、
+        OS のエラー詳細は例外チェーンにも残さない（Zero Leakage Rule）。
         """
-        context = {"path": str(path)}
-        if not _is_windows():
-            try:
-                os.chmod(path, self.UNIX_PRIVATE_MODE)
-            except OSError as exc:
-                raise KeyStorageError(
-                    MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
-                ) from exc
-            return
-
         try:
-            command = [
-                self._icacls_executable(),
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"*{_current_user_sid()}:{self.WINDOWS_PRIVATE_GRANT}",
-            ]
-            subprocess.run(command, check=True, capture_output=True)
-        except (OSError, subprocess.SubprocessError):
-            # Win32 APIの失敗詳細やコマンド出力を例外チェーンにも残さないよう、
-            # 原因は連結しない。
+            os.chmod(path, self.UNIX_PRIVATE_MODE)
+        except OSError:
             raise KeyStorageError(
-                MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
+                MsgKey.KEY_PERMISSION_SETUP_FAILED, context={"path": str(path)}
             ) from None
 
-    def verify_windows_dacl(self, path: Path) -> None:
-        """Windowsで `path` の DACL を許可リストと照合する（DESIGN.md 6章）。
+    def verify_windows_dacl(self, handle: int, path: Path) -> None:
+        """Windowsで作成済みハンドル `handle` の DACL を許可リストと照合する。
 
-        アクセスを許可する ACE の SID が、実行ユーザー（プロセストークンの
-        `TokenUser`）、現在のプロセスに紐づく Logon SID（`TokenGroups` のうち
-        `SE_GROUP_LOGON_ID` 属性を持つもの）、
-        :attr:`WINDOWS_ALLOWED_WELL_KNOWN_SIDS` のいずれとも完全一致しない
-        場合は :class:`KeyStorageError` を送出する（他セッションの Logon SID は
-        拒否する）。拒否 ACE は検証対象外とする。DACL やトークン情報を取得
-        できない場合（Win32 API の失敗等）も同じく中断する。Win32 API の失敗
-        詳細は例外チェーンにも残さない（Zero Leakage Rule）。
+        DESIGN.md 6章「Windows DACL 許可リスト再検証」に基づき、パスではなく
+        開いたハンドルの DACL を検査する。`path` は利用者向けエラー表示にのみ
+        使う。次のいずれかに該当する場合は :class:`KeyStorageError` を送出する。
+
+        - DACL が `SE_DACL_PROTECTED` を持たない、または NULL DACL である
+        - SID の位置を解釈できない許可 ACE 種別を含む
+        - 許可 ACE の SID が、実行ユーザー（プロセストークンの `TokenUser`）、
+          現在のプロセスに紐づく Logon SID（`TokenGroups` のうち
+          `SE_GROUP_LOGON_ID` 属性を持つもの）、
+          :attr:`WINDOWS_ALLOWED_WELL_KNOWN_SIDS` のいずれとも完全一致しない
+          （他セッションの Logon SID は拒否する）
+        - DACL やトークン情報を取得できない（Win32 API の失敗等）
+
+        拒否 ACE は検証対象外とする。Win32 API の失敗詳細は例外チェーンにも
+        残さない（Zero Leakage Rule）。
         """
+        from vtotp.core import windows_key_file
+
         context = {"path": str(path)}
         try:
             allowed_sids = {
-                _current_user_sid(),
-                *_current_logon_sids(),
+                windows_key_file.current_user_sid(),
+                *windows_key_file.current_logon_sids(),
                 *self.WINDOWS_ALLOWED_WELL_KNOWN_SIDS,
             }
-            granted_sids = _granting_ace_sids(path)
+            granted_sids = windows_key_file.protected_dacl_granting_sids(handle)
         except OSError:
             raise KeyStorageError(
                 MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
@@ -542,34 +235,24 @@ class KeyManager:
         DESIGN.md 6章「鍵ファイル保存とパーミッション制御」の共通フロー:
 
         1. 親ディレクトリを作成または検証する。
-        2. 予測困難な名前の一時ファイルを同一ディレクトリに排他的に作成する。
-        3. 鍵を書き込む前に、一時ファイルへ実行ユーザー専用の権限を設定する。
-        4. Windowsでは、権限設定の完了後に DACL を許可リストと再検証する。
-        5. 鍵を書き込み、flushおよびfsyncを実行する。
-        6. 32バイトであることを検証し、`os.replace` で原子的に配置する
+        2. OS 固有処理（:meth:`_create_private_temp_file`）で、実行ユーザー
+           専用の権限と必要な検証を済ませた空の一時ファイルを同一ディレクトリに
+           排他的に作成する。
+        3. 鍵を書き込み、flushおよびfsyncを実行し、ファイルを閉じる。
+        4. 32バイトであることを検証し、`os.replace` で原子的に配置する
            （`rotate=True` の場合は配置直前に既存鍵を世代繰り上げする）。
-        7. 成功・失敗を問わず、残存した一時ファイルを削除する。
+        5. 成功・失敗を問わず、自身が作成した一時ファイルが残っていれば削除する。
 
-        いずれかの段階で失敗した場合は :class:`KeyStorageError` を送出する。
+        本処理は Win32 ハンドルや SID を扱わない。いずれかの段階で失敗した
+        場合は、保存先パスを示す :class:`KeyStorageError` を送出する。OS / Win32
+        のエラー詳細は例外チェーンにも残さない（Zero Leakage Rule）。
         """
         context = {"path": str(path)}
         temp_path: Path | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(
-                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-            )
-            temp_path = Path(temp_name)
-            with os.fdopen(fd, "wb") as temp_file:
-                try:
-                    self.set_private_permissions(temp_path)
-                    if _is_windows():
-                        self.verify_windows_dacl(temp_path)
-                except KeyStorageError:
-                    # 利用者には一時ファイル名ではなく保存先パスを示す。
-                    raise KeyStorageError(
-                        MsgKey.KEY_PERMISSION_SETUP_FAILED, context=context
-                    ) from None
+            fd, temp_path = self._create_private_temp_file(path)
+            with self._open_writer(fd) as temp_file:
                 temp_file.write(key)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
@@ -579,11 +262,86 @@ class KeyManager:
                 raise KeyStorageError(MsgKey.KEY_STORAGE_FAILED, context=context)
 
             self._place_key_file(temp_path, path, rotate=rotate)
-        except OSError as exc:
-            raise KeyStorageError(MsgKey.KEY_STORAGE_FAILED, context=context) from exc
+        except KeyStorageError as error:
+            # 利用者には一時ファイル名ではなく保存先パスを示す。
+            raise KeyStorageError(error.message_key, context=context) from None
+        except OSError:
+            raise KeyStorageError(MsgKey.KEY_STORAGE_FAILED, context=context) from None
         finally:
             if temp_path is not None:
                 self._discard_temp_file(temp_path)
+
+    def _create_private_temp_file(self, path: Path) -> tuple[int, Path]:
+        """`path` と同じディレクトリに実行ユーザー専用の空の一時ファイルを作成する。
+
+        OS を判定し、対応する生成処理だけを呼び出す。書き込み用のファイル
+        ディスクリプタ（所有権は呼び出し元へ移る）と一時ファイルのパスを返す。
+        失敗時は生成処理が自身の資源を解放し、作成済みの一時ファイルを削除する。
+
+        - Unix系: :meth:`_create_unix_temp_file`（`mkstemp` + `chmod 0600`）
+        - Windows: :func:`vtotp.core.windows_key_file.create_protected_temp_file`
+          （`CreateFileW` + 保護 SDDL と、書き込み前の
+          :meth:`verify_windows_dacl`）。Windows 固有モジュールはこの分岐内で
+          のみ読み込む。
+        """
+        directory, prefix, suffix = path.parent, f".{path.name}.", ".tmp"
+        if not _is_windows():
+            return self._create_unix_temp_file(directory, prefix, suffix)
+
+        from vtotp.core import windows_key_file
+
+        try:
+            return windows_key_file.create_protected_temp_file(
+                directory,
+                prefix,
+                suffix,
+                verify=lambda handle: self.verify_windows_dacl(handle, path),
+                discard=self._discard_temp_file,
+            )
+        except windows_key_file.ProtectedDaclError:
+            raise KeyStorageError(
+                MsgKey.KEY_PERMISSION_SETUP_FAILED, context={"path": str(path)}
+            ) from None
+
+    def _create_unix_temp_file(
+        self, directory: Path, prefix: str, suffix: str
+    ) -> tuple[int, Path]:
+        """`mkstemp` で一時ファイルを排他的に作成し、鍵の書き込み前に 0600 にする。
+
+        権限設定に失敗した場合は、ファイルディスクリプタを閉じて一時ファイルを
+        削除してから例外を再送出する。
+        """
+        fd, temp_name = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=suffix)
+        temp_path = Path(temp_name)
+        try:
+            self.set_private_permissions(temp_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            self._discard_temp_file(temp_path)
+            raise
+        return fd, temp_path
+
+    @staticmethod
+    def _open_writer(fd: int) -> BinaryIO:
+        """ファイルディスクリプタ `fd` の所有権を受け取り、バイナリ書き込み用に開く。
+
+        `os.fdopen` 相当の処理を二段階で行い、各段階の所有者を一つに限定する。
+        `FileIO` の生成に失敗した場合は `fd` を閉じ、生成後は `FileIO` が `fd` を
+        所有するため、バッファの生成に失敗した場合は `FileIO` を閉じる
+        （二重解放やディスクリプタ漏れを起こさない）。
+        """
+        try:
+            raw = io.FileIO(fd, "wb")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        try:
+            return io.BufferedWriter(raw)
+        except BaseException:
+            raw.close()
+            raise
 
     def _place_key_file(self, temp_path: Path, path: Path, *, rotate: bool) -> None:
         """一時ファイルを正式パスへ配置する（必要に応じて世代繰り上げを伴う）。
@@ -627,24 +385,17 @@ class KeyManager:
             # 新鍵の配置が成功した後にのみ、退避した最古世代を破棄する。
             self._discard_temp_file(parked_oldest)
 
-    @staticmethod
-    def _discard_temp_file(temp_path: Path) -> None:
+    def _discard_temp_file(self, temp_path: Path) -> None:
         """残存した一時ファイル（最古世代の退避ファイルを含む）を削除する。
 
         削除自体の失敗で元の例外（または成功結果）を上書きしないよう、
-        ここでの `OSError` のみ抑止する。いずれのファイルも鍵の書き込み前に
-        実行ユーザー専用の権限が設定済みである。
+        ここでの `OSError` は送出しない。代わりに、残存したパスだけを
+        `on_cleanup_failure` へ渡して利用者へ通知する（OS のエラー詳細や鍵の
+        内容は渡さない）。いずれのファイルも鍵の書き込み前に実行ユーザー専用の
+        権限が設定済みである。
         """
-        with contextlib.suppress(OSError):
+        try:
             temp_path.unlink(missing_ok=True)
-
-    @staticmethod
-    def _icacls_executable() -> str:
-        """Windows標準の `icacls.exe` の絶対パスを返す。
-
-        `shell=False` でもコマンド名のみを渡すと、Windowsのプロセス生成は
-        カレントディレクトリを `System32` より先に探索する。同名の不正な
-        実行ファイルを誤って起動しないよう、`GetSystemDirectoryW` で取得した
-        システムディレクトリを明示する（環境変数には依存しない）。
-        """
-        return str(Path(_windows_system_directory()) / "icacls.exe")
+        except OSError:
+            if self._on_cleanup_failure is not None:
+                self._on_cleanup_failure(temp_path)
