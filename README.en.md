@@ -134,6 +134,14 @@ vtotp init -k "D:\USB\master.key" -l en
 
 ```
 
+<!-- Note -->
+> **Note**: Recommended key file storage location\
+> Store your master key file in a secure location dedicated to the executing user (such as a private user directory or OneDrive Personal Vault).
+
+<!-- Warning -->
+> **Warning (Storing on removable media such as FAT32 / exFAT)**\
+> FAT32 and exFAT do not preserve OS-level file permissions (Windows DACLs or POSIX permissions). If you store the key file on removable media, protect it with physical security and/or volume encryption (such as BitLocker).
+
 ### 2. Register a service (`add`)
 
 Registers a Base32-encoded TOTP secret.
@@ -292,6 +300,22 @@ Check the current configuration at any time with:
 vtotp config
 
 ```
+
+---
+
+## Security and Key Management Guidelines
+
+### OS-Specific Access Control Models
+
+When creating or rotating key files (`init` / `rekey`), vtotp applies user-exclusive access controls tailored to each OS's permission model. Windows DACLs and Linux/macOS POSIX file permissions are distinct mechanisms and are handled separately rather than treated as a single cross-platform model:
+
+- **Windows (Protected DACL at creation + pre-write verification)**:
+  - Uses the Win32 `CreateFileW` API with SDDL to apply a protected DACL **at file creation time**, blocking permission inheritance from the parent folder and restricting access to the current user (eliminating the race window between file creation and ACL assignment).
+  - Performs an additional defense-in-depth DACL verification on the opened file handle before writing key bytes (confirming `SE_DACL_PROTECTED` and checking against an allowlist).
+  - *Note*: Other processes running under the same user account, as well as privileged system/session principals (`SYSTEM`, `Administrators`, `OWNER RIGHTS`, and the current logon session SID), are not blocked by Windows DACLs.
+- **Linux / macOS (POSIX file permissions)**:
+  - Creates temporary files exclusively via `tempfile.mkstemp` and restricts permissions with `chmod 0600` (owner read/write only).
+- **Removable media (FAT32 / exFAT, etc.)**: To accommodate filesystems that do not retain OS-level permissions and to keep portable workflows working, vtotp does not verify or enforce file permissions during normal key reads (physical security and/or volume encryption is recommended when using removable media).
 
 ---
 
