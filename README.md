@@ -132,6 +132,14 @@ vtotp init --key "C:\Users\<user>\OneDrive\個人用 Vault\master.key" -l ja
 vtotp init -k "D:\USB\master.key" -l en
 ```
 
+<!-- Note -->
+> **Note**: 鍵ファイルの配置場所に関する推奨事項\
+> マスターキーファイルは、安全な場所（実行ユーザー専用のディレクトリ、OneDrive Personal Vault 等）へ配置することを推奨します。
+
+<!-- Warning -->
+> **Warning（外部メディア（FAT32 / exFAT 等）への保存時の注意事項）**\
+> FAT32 / exFAT では OS のアクセス権（Windows DACL や POSIX パーミッション）が保持されません。外部メディアへ配置する場合は物理的な管理やボリューム暗号化（BitLocker 等）を併用してください。
+
 ### 2. サービスの登録 (`add`)
 
 Base32 形式の TOTP シークレットを登録します。
@@ -282,6 +290,22 @@ vtotp config set language en
 ```powershell
 vtotp config
 ```
+
+---
+
+## セキュリティと鍵管理の運用注意事項
+
+### OS 別の鍵ファイルアクセス権保護モデル
+
+鍵ファイルの生成・更新（`init` / `rekey`）時、vtotp は各 OS のアクセス権モデルに即して実行ユーザー排他の保護を適用します。Windows の DACL と Linux / macOS の POSIX パーミッションは異なる仕組みであり、それぞれの環境に応じた保護を行います。
+
+- **Windows 環境（保護 DACL + 書き込み前再検証）**:
+  - Win32 API の `CreateFileW` と SDDL を用い、一時ファイルの**生成時点から**親フォルダからの権限継承を遮断したカレントユーザー排他の保護 DACL を付与します（ファイル作成から権限設定までの時間差による先行読み取りリスクを排除）。
+  - さらに、鍵データを書き込む前に作成済みハンドルの DACL を再検証（保護状態 `SE_DACL_PROTECTED` および許可アカウント照合）する多層防御を備えています。
+  - ※ 同一ユーザーアカウントで動作する別プロセスや、OS の管理・セッションに結び付く特権アカウント（`SYSTEM`、`Administrators`、`OWNER RIGHTS`、現在のログオンセッション SID）は、Windows の DACL による遮断対象ではありません。
+- **Linux / macOS 環境（POSIX パーミッション）**:
+  - `tempfile.mkstemp` による排他的な一時ファイル生成と `chmod 0600`（所有者のみ読み書き可能）を適用して保護します。
+- **外部メディア（FAT32 / exFAT 等）の扱い**: OS のアクセス権を保持しないファイルシステムやポータブル運用を考慮し、通常の読み込み時にはアクセス権の検証・強制を行いません（外部メディアでは物理的な管理やボリューム暗号化との併用を推奨します）。
 
 ---
 
